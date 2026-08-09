@@ -131,8 +131,22 @@ body {
   animation: pulse-soft 1.6s ease-in-out infinite;
 }
 
+@keyframes spin-soft {
+  to { transform: rotate(360deg); }
+}
+
+.animate-spin-soft {
+  animation: spin-soft 900ms linear infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .animate-pulse-soft {
     animation: none;
+  }
+
+  /* Still animated, but as a slow pulse rather than rotation: the indicator has
+     to keep signalling "working", which a frozen ring does not. */
+  .animate-spin-soft {
+    animation: pulse-soft 1.6s ease-in-out infinite;
   }
 }

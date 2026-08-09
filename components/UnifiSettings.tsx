@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Button, Card, StatusBadge } from "./ui";
+import { Button, Card, LoadingState, Spinner, StatusBadge } from "./ui";
 import * as api from "@/lib/api";
 import type { UnifiConfig } from "@/lib/types";
 
@@ -130,9 +130,7 @@ export function UnifiSettings({ onChanged }: { onChanged?: () => void }) {
       subtitle="Adds physical location, controller names, and detection of devices the controller has never seen"
     >
       {!loaded ? (
-        <p className="text-xs" style={{ color: "var(--text-muted)" }}>
-          Loading…
-        </p>
+        <LoadingState title="Loading controller settings…" />
       ) : (
         <div className="space-y-3">
           <div
@@ -216,7 +214,14 @@ export function UnifiSettings({ onChanged }: { onChanged?: () => void }) {
 
           <div className="flex flex-wrap gap-2">
             <Button variant="primary" onClick={test} disabled={busy || !config.host || !config.username}>
-              {busy ? "Working…" : "Test connection"}
+              {busy ? (
+                <>
+                  <Spinner size={13} />
+                  Contacting controller…
+                </>
+              ) : (
+                "Test connection"
+              )}
             </Button>
             <Button onClick={save} disabled={busy || !config.host || !config.username}>
               Save

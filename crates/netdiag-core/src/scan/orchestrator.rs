@@ -131,7 +131,8 @@ where
     /* ---------------------------------------------------------- phase: host */
     run.start(ScanPhase::Host);
 
-    let (mut host, host_warnings) = hostinfo::collect(&config.extra_ranges).await;
+    let (mut host, host_warnings) =
+        hostinfo::collect_scoped(&config.extra_ranges, &config.restrict_to_subnets).await;
     for warning in host_warnings {
         run.warn(warning);
     }
@@ -232,6 +233,17 @@ where
 
         for ip in hinted {
             if !is_private_ipv4(ip) {
+                continue;
+            }
+            // An announcement from outside the selected network is a neighbour's
+            // device, not this network's. Following it would pull another
+            // network's addresses into this network's history.
+            if !config.restrict_to_subnets.is_empty()
+                && !config
+                    .restrict_to_subnets
+                    .iter()
+                    .any(|allowed| parse_cidr(allowed).map(|c| c.contains(ip)).unwrap_or(false))
+            {
                 continue;
             }
             let already = host.scan_targets.iter().any(|target| {

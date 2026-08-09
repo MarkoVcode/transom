@@ -1,7 +1,7 @@
 "use client";
 
 import { Fragment } from "react";
-import { Card, EmptyState, Pill, StatusBadge } from "./ui";
+import { Card, EmptyState, LoadingState, Pill, StatusBadge } from "./ui";
 import type { Reconciliation, UnifiSnapshot } from "@/lib/types";
 
 function formatSpeed(mbps?: number): string {
@@ -74,16 +74,51 @@ function SiteHealth({ unifi }: { unifi: UnifiSnapshot }) {
 export function ReconciliationPanel({
   reconciliation,
   unifi,
+  loading = false,
+  fetching = false,
+  configured = false,
+  networkName,
 }: {
   reconciliation?: Reconciliation;
   unifi?: UnifiSnapshot;
+  /** The snapshot this would come from is still being read. */
+  loading?: boolean;
+  /** A scan is in flight and currently talking to the controller. */
+  fetching?: boolean;
+  /** A controller is configured for the selected network. */
+  configured?: boolean;
+  networkName?: string;
 }) {
+  if (fetching || loading) {
+    return (
+      <Card title="Controller reconciliation">
+        <LoadingState
+          title={fetching ? "Querying the controller…" : "Loading controller data…"}
+          hint={
+            fetching
+              ? "Matching this scan's devices against the controller's records. A controller that is slow to answer can add a minute or more."
+              : "Reading the latest scan for this network."
+          }
+        />
+      </Card>
+    );
+  }
+
   if (!reconciliation) {
+    // "No controller connected" is wrong when one *is* connected and simply has
+    // not been through a scan yet — and it sends the user looking for a setting
+    // that is already set.
     return (
       <Card title="Controller reconciliation">
         <EmptyState
-          title="No controller connected"
-          hint="Connect a UniFi controller under Setup & Status to compare what the scan finds against what the controller knows."
+          title={configured ? "No controller data in this scan" : "No controller connected"}
+          hint={
+            configured
+              ? `A controller is configured for ${
+                  networkName ? `“${networkName}”` : "this network"
+                }, but the latest scan predates it or could not reach it. Run a scan to compare what the scan finds against what the controller knows.`
+              : "Connect a UniFi controller below to compare what the scan finds against what the controller knows."
+          }
         />
       </Card>
     );

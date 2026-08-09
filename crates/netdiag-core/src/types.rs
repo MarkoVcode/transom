@@ -470,10 +470,15 @@ pub enum ScanPhase {
     Connectivity,
     Wifi,
     Correlate,
+    /// Controller correlation. Driven by the desktop shell rather than the
+    /// engine — the engine holds no credentials — but it is a phase of the same
+    /// run, and a controller that is slow to answer is exactly the wait the user
+    /// needs to see rather than guess at.
+    Controller,
 }
 
 impl ScanPhase {
-    pub const ORDER: [ScanPhase; 8] = [
+    pub const ORDER: [ScanPhase; 9] = [
         ScanPhase::Host,
         ScanPhase::Announce,
         ScanPhase::Sweep,
@@ -482,6 +487,7 @@ impl ScanPhase {
         ScanPhase::Connectivity,
         ScanPhase::Wifi,
         ScanPhase::Correlate,
+        ScanPhase::Controller,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -494,6 +500,7 @@ impl ScanPhase {
             ScanPhase::Connectivity => "Latency, DNS & path",
             ScanPhase::Wifi => "Wi-Fi & channel survey",
             ScanPhase::Correlate => "Correlating results",
+            ScanPhase::Controller => "UniFi controller correlation",
         }
     }
 }
@@ -541,6 +548,22 @@ pub enum PortProfile {
 #[serde(rename_all = "camelCase")]
 pub struct ScanConfig {
     pub extra_ranges: Vec<String>,
+    /// Subnets the scan is confined to — the selected network's, in practice.
+    ///
+    /// A machine is routinely attached to more than one subnet (a LAN plus a
+    /// VPN, a second NIC, a hypervisor bridge). Sweeping all of them and filing
+    /// the result under whichever network happens to be selected is how two
+    /// networks' devices end up in one history, and how a controller ends up
+    /// reporting every device of the *other* network as unaccounted for.
+    ///
+    /// Empty means unconfined, which is only the right answer when no network is
+    /// selected yet.
+    ///
+    /// Defaulted rather than required: snapshots written before this existed
+    /// record a config without it, and every one of them would otherwise fail to
+    /// load — taking the whole history with it.
+    #[serde(default)]
+    pub restrict_to_subnets: Vec<String>,
     pub port_profile: PortProfile,
     pub include_discovered_subnets: bool,
     pub sweep_concurrency: usize,
@@ -552,6 +575,7 @@ impl Default for ScanConfig {
     fn default() -> Self {
         Self {
             extra_ranges: Vec::new(),
+            restrict_to_subnets: Vec::new(),
             port_profile: PortProfile::Standard,
             include_discovered_subnets: true,
             sweep_concurrency: 64,

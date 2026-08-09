@@ -313,7 +313,8 @@ export function NetworksPanel({
           <p className="text-sm" style={{ color: "var(--text-secondary)" }}>
             Updates the active network&apos;s fingerprint from where this machine is now. Use it
             if the network was created before its gateway address could be read, or after the
-            router was replaced.
+            router was replaced. It also decides what a scan of this network sweeps, so
+            re-detecting is refused unless this machine is actually on it.
           </p>
           <div className="mt-2">
             <Button onClick={() => run(api.refreshNetworkFingerprint)} disabled={busy}>

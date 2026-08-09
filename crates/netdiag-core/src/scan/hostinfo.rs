@@ -29,6 +29,17 @@ fn mask_to_prefix(mask: Ipv4Addr) -> u8 {
 }
 
 pub async fn collect(extra_ranges: &[String]) -> (HostInfo, Vec<String>) {
+    collect_scoped(extra_ranges, &[]).await
+}
+
+/// As [`collect`], but confining the local targets to `restrict_to`.
+///
+/// See [`ScanConfig::restrict_to_subnets`](crate::types::ScanConfig::restrict_to_subnets)
+/// for why a scan must not simply sweep every subnet this machine can see.
+pub async fn collect_scoped(
+    extra_ranges: &[String],
+    restrict_to: &[String],
+) -> (HostInfo, Vec<String>) {
     let mut warnings = Vec::new();
     let mut interfaces = enumerate_interfaces();
 
@@ -42,7 +53,7 @@ pub async fn collect(extra_ranges: &[String]) -> (HostInfo, Vec<String>) {
     let gateway_dev = gateway.as_ref().map(|g| g.dev.clone()).unwrap_or_default();
     classify(&mut interfaces, &gateway_dev, &mut warnings);
 
-    let scan_targets = build_targets(&interfaces, extra_ranges, &mut warnings);
+    let scan_targets = build_targets(&interfaces, extra_ranges, restrict_to, &mut warnings);
 
     let host = HostInfo {
         hostname: hostname(),
@@ -66,12 +77,18 @@ pub async fn collect(extra_ranges: &[String]) -> (HostInfo, Vec<String>) {
 /// probes — so the UI can call it whenever its inputs change to show what
 /// "Run scan" will actually do before it is pressed.
 pub fn preview_targets(extra_ranges: &[String]) -> Vec<ScanTarget> {
+    preview_targets_scoped(extra_ranges, &[])
+}
+
+/// As [`preview_targets`], confined to `restrict_to`. This is what the sidebar
+/// shows, and it must agree with what the scan will actually do.
+pub fn preview_targets_scoped(extra_ranges: &[String], restrict_to: &[String]) -> Vec<ScanTarget> {
     let mut warnings = Vec::new();
     let mut interfaces = enumerate_interfaces();
     // No gateway lookup here: it only sets `is_primary`, which the target
     // list does not depend on.
     classify(&mut interfaces, "", &mut warnings);
-    build_targets(&interfaces, extra_ranges, &mut warnings)
+    build_targets(&interfaces, extra_ranges, restrict_to, &mut warnings)
 }
 
 fn enumerate_interfaces() -> Vec<InterfaceInfo> {
@@ -212,6 +229,7 @@ fn classify(interfaces: &mut [InterfaceInfo], gateway_dev: &str, warnings: &mut 
 fn build_targets(
     interfaces: &[InterfaceInfo],
     extra_ranges: &[String],
+    restrict_to: &[String],
     warnings: &mut Vec<String>,
 ) -> Vec<ScanTarget> {
     let mut targets = Vec::new();
@@ -227,6 +245,20 @@ fn build_targets(
             };
             let key = parsed.canonical();
             if !seen.insert(key.clone()) {
+                continue;
+            }
+            // A subnet this machine is on but the selected network is not is
+            // somebody else's network. Sweeping it would file its devices under
+            // the selected network's history.
+            if !restrict_to.is_empty()
+                && !restrict_to
+                    .iter()
+                    .any(|allowed| crate::netutil::cidrs_overlap(allowed, &key))
+            {
+                warnings.push(format!(
+                    "Not scanning {key} on {} — it is not part of the selected network",
+                    iface.name
+                ));
                 continue;
             }
             targets.push(ScanTarget {
@@ -364,10 +396,46 @@ mod tests {
         let mut warnings = Vec::new();
         classify(&mut interfaces, "wlo1", &mut warnings);
 
-        let targets = build_targets(&interfaces, &[], &mut warnings);
+        let targets = build_targets(&interfaces, &[], &[], &mut warnings);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].cidr, "10.0.3.0/24");
         assert_eq!(targets[0].host_count, 254);
+    }
+
+    #[test]
+    fn a_restriction_drops_local_subnets_outside_the_selected_network() {
+        // The merge bug: a machine on two subnets swept both, and every device
+        // of the unselected one was filed under the selected network.
+        let mut interfaces = vec![
+            iface("wlo1", "10.0.3.221", 24, "UP"),
+            iface("eth0", "192.168.1.50", 24, "UP"),
+        ];
+        let mut warnings = Vec::new();
+        classify(&mut interfaces, "wlo1", &mut warnings);
+
+        let targets = build_targets(&interfaces, &[], &["10.0.3.0/24".into()], &mut warnings);
+        assert_eq!(
+            targets.iter().map(|t| t.cidr.as_str()).collect::<Vec<_>>(),
+            vec!["10.0.3.0/24"],
+            "only the selected network's subnet may be swept"
+        );
+        assert!(warnings.iter().any(|w| w.contains("192.168.1.0/24")));
+    }
+
+    #[test]
+    fn an_explicit_range_survives_a_restriction_that_excludes_it() {
+        // Typing a range is the user aiming the scan; it defines the target
+        // rather than being filtered by it.
+        let interfaces: Vec<InterfaceInfo> = Vec::new();
+        let mut warnings = Vec::new();
+        let targets = build_targets(
+            &interfaces,
+            &["192.168.9.0/24".into()],
+            &["10.0.3.0/24".into()],
+            &mut warnings,
+        );
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].cidr, "192.168.9.0/24");
     }
 
     #[test]
@@ -385,7 +453,7 @@ mod tests {
     fn invalid_manual_ranges_become_warnings_not_failures() {
         let interfaces: Vec<InterfaceInfo> = Vec::new();
         let mut warnings = Vec::new();
-        let targets = build_targets(&interfaces, &["not-a-cidr".into()], &mut warnings);
+        let targets = build_targets(&interfaces, &["not-a-cidr".into()], &[], &mut warnings);
         assert!(targets.is_empty());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("Ignoring range"));

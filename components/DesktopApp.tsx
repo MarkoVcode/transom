@@ -24,8 +24,10 @@ import {
   formatDuration,
   formatRelativeTime,
   latencyTone,
+  LoadingState,
   lossTone,
   signalTone,
+  Spinner,
   StatusBadge,
   type StatusTone,
 } from "./ui";
@@ -34,6 +36,7 @@ import {
   isNewDevice,
   type Detection,
   type DiscoveredNetwork,
+  type NetworkList,
   type NetworkProfile,
   type AutoRepeatState,
   type DoctorReport,
@@ -96,29 +99,72 @@ export function DesktopApp() {
   const [detection, setDetection] = useState<Detection | null>(null);
   const [scanTargets, setScanTargets] = useState<ScanTarget[] | null>(null);
   const [discovery, setDiscovery] = useState<DiscoveredNetwork[] | null>(null);
+  /* `snapshot === null` cannot distinguish "nothing scanned yet" from "not read
+   * yet", and rendering the empty state during a load is what made the app look
+   * like it had lost a network's history until the user navigated away and
+   * back. These two say which it is. */
+  const [booted, setBooted] = useState(false);
+  const [snapshotLoading, setSnapshotLoading] = useState(false);
 
   const mounted = useRef(true);
 
   const loadSnapshot = useCallback(async (id: string) => {
+    setSnapshotLoading(true);
     try {
       const result = await api.getSnapshot(id);
       if (mounted.current) setSnapshot(result.snapshot);
     } catch {
-      // A missing snapshot is not an error worth interrupting the user for.
+      // A missing snapshot is not an error worth interrupting the user for —
+      // but it must not leave the previous network's data on screen either.
+      if (mounted.current) setSnapshot(null);
+    } finally {
+      if (mounted.current) setSnapshotLoading(false);
     }
   }, []);
 
-  const refreshNetworks = useCallback(async (): Promise<NetworkProfile[]> => {
+  /** Reads the selected network's newest snapshot, or clears it if it has none. */
+  const reloadSnapshot = useCallback(async () => {
+    setSnapshotLoading(true);
+    try {
+      const status = await api.getStatus();
+      if (!mounted.current) return;
+      setRunning(status.running);
+      setAutoRepeat(status.autoRepeat);
+      if (status.phases.length) setPhases(status.phases);
+
+      if (!status.lastSnapshotId) {
+        setSnapshot(null);
+        return;
+      }
+      const result = await api.getSnapshot(status.lastSnapshotId);
+      if (mounted.current) setSnapshot(result.snapshot);
+    } catch {
+      if (mounted.current) setSnapshot(null);
+    } finally {
+      if (mounted.current) setSnapshotLoading(false);
+    }
+  }, []);
+
+  const refreshNetworks = useCallback(async (): Promise<NetworkList> => {
     try {
       const list = await api.listNetworks();
-      if (!mounted.current) return list.networks;
-      setNetworks(list.networks);
-      setActiveNetwork(list.active);
-      return list.networks;
+      if (mounted.current) {
+        setNetworks(list.networks);
+        setActiveNetwork(list.active);
+      }
+      return list;
     } catch {
       // Not fatal: the app still works against whichever network is selected.
-      return [];
+      return { networks: [] };
     }
+  }, []);
+
+  /* The scan form is a view of the selected network, not a free-text field the
+   * user has to remember to keep in sync: re-scanning is the common case, and
+   * the range it should use is the one the network is defined by. */
+  const syncScanRange = useCallback((list: NetworkProfile[], id?: string) => {
+    const profile = list.find((network) => network.id === id);
+    setExtraRange(profile?.fingerprint.subnets[0] ?? "");
   }, []);
 
   const refreshDoctor = useCallback(async (force: boolean) => {
@@ -140,60 +186,49 @@ export function DesktopApp() {
    */
   const changeNetwork = useCallback(
     async (id: string) => {
+      setSnapshot(null);
+      setSnapshotLoading(true);
       try {
         await api.switchNetwork(id);
-        setSnapshot(null);
         setActiveNetwork(id);
         const list = await refreshNetworks();
-        const status = await api.getStatus();
-        if (status.lastSnapshotId) await loadSnapshot(status.lastSnapshotId);
+        syncScanRange(list.networks, id);
+        await reloadSnapshot();
         setRefreshToken((token) => token + 1);
 
         // The doctor's controller check is per network; a stale report would
         // describe the previous network's controller.
         void refreshDoctor(false);
-
-        // Pre-fill the scan range with the selected network's subnet when this
-        // machine is not attached to it — that makes "Run scan" mean "scan the
-        // selected network", not silently "scan wherever I am".
-        try {
-          const profile = list.find((network) => network.id === id);
-          const subnet = profile?.fingerprint.subnets[0];
-          const local = await api.previewScanTargets([]);
-          if (!mounted.current) return;
-          setExtraRange(subnet && !local.some((t) => t.cidr === subnet) ? subnet : "");
-        } catch {
-          // Pre-filling is a convenience; failing to do it changes nothing.
-        }
       } catch (err) {
         setError(String(err));
+        if (mounted.current) setSnapshotLoading(false);
       }
     },
-    [loadSnapshot, refreshNetworks, refreshDoctor],
+    [refreshNetworks, reloadSnapshot, refreshDoctor, syncScanRange],
   );
 
   // Initial load: status, capabilities, latest snapshot.
   useEffect(() => {
     mounted.current = true;
 
-    // During `next build`'s static export pass there is no Tauri host, so there
-    // is nothing to load. Returning before touching state also keeps this effect
-    // free of synchronous setState calls.
-    if (!api.isDesktop()) return;
-
     (async () => {
+      // During `next build`'s static export pass, and under `dev:web`, there is
+      // no Tauri host and nothing to load — settle immediately so the shell
+      // renders its empty states rather than spinning forever.
+      if (!api.isDesktop()) {
+        setBooted(true);
+        return;
+      }
+
       // The doctor probes hardware and, when a controller is configured, a
       // live network service — seconds, tens when something is unreachable.
       // It must never gate showing data that is already on disk, so it runs
       // concurrently and fills its panel in whenever it finishes.
       void refreshDoctor(true);
 
-      const status = await api.getStatus();
+      await reloadSnapshot();
       if (!mounted.current) return;
-      setRunning(status.running);
-      setAutoRepeat(status.autoRepeat);
-      if (status.phases.length) setPhases(status.phases);
-      if (status.lastSnapshotId) await loadSnapshot(status.lastSnapshotId);
+      setBooted(true);
 
       const [dir, version] = await Promise.all([
         api.getDataDir().catch(() => undefined),
@@ -204,8 +239,10 @@ export function DesktopApp() {
       setAppVersion(version);
 
       const list = await refreshNetworks();
+      if (!mounted.current) return;
+      syncScanRange(list.networks, list.active);
 
-      if (list.length === 0) {
+      if (list.networks.length === 0) {
         // A true first run (or post-reset): offer the networks this machine
         // can see instead of the single-network detection prompt.
         try {
@@ -232,7 +269,7 @@ export function DesktopApp() {
     return () => {
       mounted.current = false;
     };
-  }, [loadSnapshot, refreshDoctor, refreshNetworks]);
+  }, [reloadSnapshot, refreshDoctor, refreshNetworks, syncScanRange]);
 
   // What "Run scan" would sweep, shown under the button so the target is never
   // a mystery. Debounced because it re-runs as the extra-range field is typed;
@@ -264,10 +301,12 @@ export function DesktopApp() {
             setPhases(event.phases);
             break;
           case "networkChanged":
-            // The scan was filed under the network the machine is actually on;
-            // follow it so the dropdown and history match what was written.
+            // Only fires when nothing was selected and the scan had to be filed
+            // somewhere; follow it so the dropdown and the scan form describe
+            // the network the results actually went to.
             setSnapshot(null);
-            refreshNetworks();
+            setActiveNetwork(event.id);
+            refreshNetworks().then((list) => syncScanRange(list.networks, event.id));
             break;
           case "done":
             setRunning(false);
@@ -290,7 +329,7 @@ export function DesktopApp() {
       });
 
     return () => unlisten?.();
-  }, [loadSnapshot, refreshNetworks]);
+  }, [loadSnapshot, refreshNetworks, syncScanRange]);
 
   const blocked = doctor?.blocked ?? false;
 
@@ -302,9 +341,15 @@ export function DesktopApp() {
       if (range) {
         // A range nothing covers yet becomes a network of its own before the
         // scan starts, so the results have somewhere of their own to live —
-        // and a range an existing network covers selects that network.
-        await api.ensureNetworkForRange(range);
-        await refreshNetworks();
+        // and a range an existing network covers selects that network. The
+        // field normally already holds the selected network's subnet, in which
+        // case this resolves back to it and changes nothing.
+        const profile = await api.ensureNetworkForRange(range);
+        const list = await refreshNetworks();
+        if (mounted.current && profile.id !== activeNetwork) {
+          setActiveNetwork(profile.id);
+          syncScanRange(list.networks, profile.id);
+        }
       }
       const id = await api.startScan({
         portProfile,
@@ -351,6 +396,11 @@ export function DesktopApp() {
   );
 
   const activePhase = phases.find((p) => p.status === "running");
+  const activeProfile = networks.find((network) => network.id === activeNetwork);
+
+  /* Everything network-scoped is unreadable until the first load settles, so one
+   * flag covers the lot rather than each panel inventing its own. */
+  const contentLoading = !booted || snapshotLoading;
 
   const renderNavItem = (item: NavItem) => {
     const active = section === item.id;
@@ -407,7 +457,8 @@ export function DesktopApp() {
           candidates={discovery}
           onDone={async () => {
             setDiscovery(null);
-            await refreshNetworks();
+            const list = await refreshNetworks();
+            syncScanRange(list.networks, list.active);
             setRefreshToken((token) => token + 1);
           }}
           onSkip={() => setDiscovery(null)}
@@ -420,9 +471,10 @@ export function DesktopApp() {
           onResolved={async () => {
             setDetection(null);
             setSnapshot(null);
-            await refreshNetworks();
-            const status = await api.getStatus();
-            if (status.lastSnapshotId) await loadSnapshot(status.lastSnapshotId);
+            const list = await refreshNetworks();
+            setActiveNetwork(list.active);
+            syncScanRange(list.networks, list.active);
+            await reloadSnapshot();
             setRefreshToken((token) => token + 1);
           }}
           onDismiss={() => setDetection(null)}
@@ -520,6 +572,13 @@ export function DesktopApp() {
             <CapabilityBanner report={doctor} onOpenSetup={() => setSection("setup")} />
           )}
 
+          {/* Progress is docked in the sidebar, but the content area is where
+              the user is looking and where the results will land — saying so
+              here is what stops a long phase reading as a frozen page. */}
+          {running && section !== "setup" && section !== "networks" && (
+            <ScanNotice phases={phases} networkName={activeProfile?.name} />
+          )}
+
           {section === "setup" ? (
             /* System scope only — the per-network controller settings live on
                the Controller page, beside the data they produce. */
@@ -544,12 +603,13 @@ export function DesktopApp() {
                 }
               }}
               onChanged={async () => {
-                await refreshNetworks();
                 // Switching or deleting changes which history is current, so
                 // drop the loaded snapshot rather than showing a stale one.
                 setSnapshot(null);
-                const status = await api.getStatus();
-                if (status.lastSnapshotId) await loadSnapshot(status.lastSnapshotId);
+                const list = await refreshNetworks();
+                syncScanRange(list.networks, list.active);
+                setActiveNetwork(list.active);
+                await reloadSnapshot();
                 setRefreshToken((token) => token + 1);
               }}
             />
@@ -562,12 +622,27 @@ export function DesktopApp() {
               <ReconciliationPanel
                 reconciliation={snapshot?.reconciliation}
                 unifi={snapshot?.unifi}
+                loading={contentLoading}
+                fetching={running && controllerPhaseIsRunning(phases)}
+                configured={activeProfile?.hasUnifi ?? false}
+                networkName={activeProfile?.name}
               />
               <UnifiSettings
                 key={activeNetwork ?? "none"}
                 onChanged={() => refreshDoctor(true)}
               />
             </div>
+          ) : contentLoading ? (
+            <Card>
+              <LoadingState
+                title="Loading this network’s latest scan…"
+                hint={
+                  activeProfile
+                    ? `Reading the stored history for “${activeProfile.name}”.`
+                    : "Reading the stored scan history."
+                }
+              />
+            </Card>
           ) : !snapshot ? (
             <Card>
               <EmptyState
@@ -686,10 +761,64 @@ export function DesktopApp() {
   );
 }
 
+/** True while the controller step of a run is in flight. */
+function controllerPhaseIsRunning(phases: PhaseState[]): boolean {
+  return phases.some((phase) => phase.phase === "controller" && phase.status === "running");
+}
+
+/**
+ * In-content notice while a scan runs.
+ *
+ * The sidebar dock has the detail; this exists because the content area is
+ * where the user is actually looking, and a page that shows the previous scan
+ * with no explanation is indistinguishable from one that has stopped updating.
+ */
+function ScanNotice({
+  phases,
+  networkName,
+}: {
+  phases: PhaseState[];
+  networkName?: string;
+}) {
+  const active = phases.find((phase) => phase.status === "running");
+  const controller = controllerPhaseIsRunning(phases);
+
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="mb-4 flex items-center gap-3 rounded-xl border px-4 py-3"
+      style={{ borderColor: "var(--border-strong)", background: "var(--surface-1)" }}
+    >
+      <Spinner />
+      <div className="min-w-0 text-sm">
+        <p className="font-medium">
+          {controller
+            ? "Contacting the UniFi controller…"
+            : networkName
+              ? `Scanning ${networkName}…`
+              : "Scanning…"}
+        </p>
+        <p className="mt-0.5 text-xs" style={{ color: "var(--text-secondary)" }}>
+          {controller
+            ? "The scan has finished; matching its devices against the controller. A controller that is slow to answer can add a minute or more."
+            : active
+              ? `${active.label}${
+                  active.progress
+                    ? ` — ${active.progress.current} of ${active.progress.total}`
+                    : ""
+                }. This page updates when the scan completes.`
+              : "Starting. This page updates when the scan completes."}
+        </p>
+      </div>
+    </div>
+  );
+}
+
 /**
  * What "Run scan" will sweep (idle) or is sweeping (running). The default is
- * the local subnet, which was previously never stated anywhere — an empty
- * extra-range field made it look like the scan had no defined target.
+ * the selected network's subnet, which was previously never stated anywhere —
+ * an empty range field made it look like the scan had no defined target.
  */
 function TargetPreview({ targets }: { targets: ScanTarget[] | null }) {
   if (targets === null) return null;
@@ -859,13 +988,13 @@ function ScanOptions({
       </label>
 
       <label className="mt-2 block text-[11px]" style={{ color: "var(--text-secondary)" }}>
-        Target range
+        Scan range
         <input
           type="text"
           value={extraRange}
           onChange={(e) => setExtraRange(e.target.value)}
           placeholder="192.168.1.0/24"
-          title="Filled automatically when the selected network is not the one this machine is on. A range no saved network covers becomes a new network when the scan starts."
+          title="Pre-filled with the selected network's subnet, so re-scanning covers the same ground. A range no saved network covers becomes a new network when the scan starts."
           className="mt-1 w-full rounded-lg border px-2 py-1 text-xs"
           style={{
             borderColor: "var(--border-strong)",

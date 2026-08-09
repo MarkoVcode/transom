@@ -548,7 +548,9 @@ export type ScanPhaseId =
   | "identity"
   | "connectivity"
   | "wifi"
-  | "correlate";
+  | "correlate"
+  /** Driven by the desktop shell, not the engine — see `ScanPhase::Controller`. */
+  | "controller";
 
 export type PhaseStatus = "pending" | "running" | "done" | "skipped" | "error";
 
@@ -564,6 +566,8 @@ export type PortProfile = "quick" | "standard" | "deep";
 
 export interface ScanConfig {
   extraRanges: string[];
+  /** Subnets the sweep is confined to — the selected network's, in practice. */
+  restrictToSubnets: string[];
   portProfile: PortProfile;
   includeDiscoveredSubnets: boolean;
   sweepConcurrency: number;

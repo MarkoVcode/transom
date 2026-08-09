@@ -166,6 +166,47 @@ export function Button({
   );
 }
 
+/**
+ * Work-in-progress indicator.
+ *
+ * Paired with text everywhere it is used: a bare spinner says "wait" but never
+ * what for, and the waits here (a sweep, a controller that answers slowly) are
+ * long enough that the difference matters.
+ */
+export function Spinner({ size = 16 }: { size?: number }) {
+  return (
+    <span
+      aria-hidden
+      className="animate-spin-soft inline-block shrink-0 rounded-full border-2 border-solid align-middle"
+      style={{
+        width: size,
+        height: size,
+        borderColor: "var(--gridline)",
+        borderTopColor: "var(--series-1)",
+      }}
+    />
+  );
+}
+
+/**
+ * The counterpart to `EmptyState` for the case that is *not* empty, only not
+ * here yet. Rendering "nothing found" while data is still loading is a lie the
+ * user can only disprove by navigating away and back.
+ */
+export function LoadingState({ title, hint }: { title: string; hint?: string }) {
+  return (
+    <div className="py-10 text-center" role="status" aria-live="polite">
+      <Spinner size={22} />
+      <p className="mt-3 text-sm font-medium">{title}</p>
+      {hint && (
+        <p className="mx-auto mt-1 max-w-md text-xs" style={{ color: "var(--text-secondary)" }}>
+          {hint}
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function EmptyState({ title, hint }: { title: string; hint?: string }) {
   return (
     <div className="py-10 text-center">
