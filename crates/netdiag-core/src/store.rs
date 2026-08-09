@@ -537,6 +537,7 @@ mod tests {
                 ..Default::default()
             },
             capabilities: Vec::new(),
+            off_scope: Vec::new(),
             baseline: false,
             unifi: None,
             reconciliation: None,

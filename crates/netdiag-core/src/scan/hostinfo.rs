@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 
 /// Interface name prefixes that are never worth scanning.
-fn is_virtual_interface(name: &str) -> bool {
+pub fn is_virtual_interface(name: &str) -> bool {
     const VIRTUAL_PREFIXES: &[&str] = &[
         "docker", "br-", "virbr", "veth", "tun", "tap", "vboxnet", "vmnet", "utun", "awdl", "llw",
         "bridge", "zt", "wg",
@@ -234,6 +234,7 @@ fn build_targets(
 ) -> Vec<ScanTarget> {
     let mut targets = Vec::new();
     let mut seen = HashSet::new();
+    let mut skipped = HashSet::new();
 
     for iface in interfaces.iter().filter(|i| i.scannable) {
         for addr in &iface.ipv4 {
@@ -244,21 +245,28 @@ fn build_targets(
                 continue;
             };
             let key = parsed.canonical();
-            if !seen.insert(key.clone()) {
-                continue;
-            }
+
             // A subnet this machine is on but the selected network is not is
             // somebody else's network. Sweeping it would file its devices under
             // the selected network's history.
+            //
+            // Checked before `seen`, so a skipped subnet leaves no trace there:
+            // marking it seen would silently swallow an identical explicit range.
             if !restrict_to.is_empty()
                 && !restrict_to
                     .iter()
                     .any(|allowed| crate::netutil::cidrs_overlap(allowed, &key))
             {
-                warnings.push(format!(
-                    "Not scanning {key} on {} — it is not part of the selected network",
-                    iface.name
-                ));
+                if skipped.insert(key.clone()) {
+                    warnings.push(format!(
+                        "Not scanning {key} on {} — it is not part of the selected network",
+                        iface.name
+                    ));
+                }
+                continue;
+            }
+
+            if !seen.insert(key.clone()) {
                 continue;
             }
             targets.push(ScanTarget {

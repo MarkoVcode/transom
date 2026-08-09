@@ -420,6 +420,28 @@ export interface DiscoveredNetwork {
   alreadyTracked: boolean;
 }
 
+/** Why a neighbouring subnet is believed to exist and be reachable. */
+export type SubnetEvidence =
+  | { kind: "route"; dev: string; via?: string }
+  | { kind: "controller"; name: string; vlan?: number }
+  | { kind: "responder"; ip: string; detail: string }
+  | { kind: "traceHop"; ip: string; hop: number };
+
+/**
+ * A subnet other than the tracked ones, with proof of reachability.
+ *
+ * Never extrapolated from an address — see the `adjacent` module in the engine
+ * for where the line falls.
+ */
+export interface AdjacentSubnet {
+  cidr: string;
+  /** The prefix was assumed (/24 around a proven address), not stated. */
+  prefixAssumed: boolean;
+  evidence: SubnetEvidence[];
+  alreadyTracked: boolean;
+  summary: string;
+}
+
 export interface NetworkProfile {
   id: string;
   name: string;
@@ -628,6 +650,31 @@ export interface ScanSnapshot {
   baseline: boolean;
   unifi?: UnifiSnapshot;
   reconciliation?: Reconciliation;
+  /**
+   * Addresses that answered from outside every scan target — deliberately not
+   * devices of this network, kept as evidence of a neighbouring subnet.
+   */
+  offScope?: OffScopeSighting[];
+}
+
+/** An address that answered but lies outside every scan target. */
+export interface OffScopeSighting {
+  ip: string;
+  /** How it made itself known — `mdns`, `ssdp`. */
+  sources: string[];
+}
+
+/**
+ * True when nothing in this scan was on a link the machine is attached to.
+ *
+ * ARP is link-local, so such a scan can never resolve a MAC or a vendor — worth
+ * stating once rather than flagging every device as if it were a surprise.
+ */
+export function isRoutedScan(snapshot: ScanSnapshot): boolean {
+  return (
+    snapshot.host.scanTargets.length > 0 &&
+    snapshot.host.scanTargets.every((target) => target.source !== "local")
+  );
 }
 
 /** A device is only "new" when there was a previous scan to be absent from. */
@@ -684,13 +731,33 @@ export interface ScanStatus {
   phases: PhaseState[];
   lastSnapshotId?: string;
   autoRepeat: AutoRepeatState;
+  /** The network a running scan belongs to — not necessarily the selected one. */
+  scanningNetworkId?: string;
+  scanningNetworkName?: string;
 }
 
+/**
+ * Live scan progress.
+ *
+ * Every event names the network the scan belongs to, so the UI can label a
+ * running scan by what it is actually doing rather than by whatever is
+ * currently selected.
+ */
 export type ScanEvent =
-  | { type: "phase"; phases: PhaseState[] }
+  | {
+      type: "phase";
+      phases: PhaseState[];
+      networkId?: string;
+      networkName?: string;
+    }
   | { type: "warning"; message: string }
-  /** The scan was filed under a different network than the one selected. */
+  /** Nothing was selected, so the scan had to be filed somewhere. */
   | { type: "networkChanged"; id: string; name: string }
-  | { type: "done"; snapshotId: string }
-  | { type: "error"; message: string }
-  | { type: "cancelled" };
+  | {
+      type: "done";
+      snapshotId: string;
+      networkId?: string;
+      networkName?: string;
+    }
+  | { type: "error"; message: string; networkId?: string }
+  | { type: "cancelled"; networkId?: string };

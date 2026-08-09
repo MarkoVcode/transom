@@ -18,6 +18,7 @@
 //! * **Degrade, never fail.** A missing tool produces a warning and a reduced
 //!   snapshot, not an error. [`doctor`] explains exactly what was lost and why.
 
+pub mod adjacent;
 pub mod doctor;
 pub mod exec;
 pub mod netutil;

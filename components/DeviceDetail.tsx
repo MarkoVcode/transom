@@ -74,7 +74,12 @@ export function DeviceDetail({ device }: { device: Device }) {
             value={
               <span className="flex flex-wrap items-center gap-2">
                 <span className="font-mono">{device.sourceRange ?? "—"}</span>
-                {device.offSubnet && <StatusBadge tone="warning" label="Off-subnet" />}
+                {device.offSubnet && (
+                  <StatusBadge
+                    tone="neutral"
+                    label="Reached by routing — no hardware address available"
+                  />
+                )}
               </span>
             }
           />

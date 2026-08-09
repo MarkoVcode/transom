@@ -9,6 +9,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AdjacentSubnet,
   AutoRepeatState,
   DiscoveredNetwork,
   DoctorReport,
@@ -192,6 +193,14 @@ export async function clearNetworkHistory(id: string): Promise<number> {
 /** Subnets this machine is attached to, for the network picker. */
 export async function discoverLocalNetworks(): Promise<DiscoveredNetwork[]> {
   return invoke<DiscoveredNetwork[]>("discover_local_networks");
+}
+
+/**
+ * Other subnets this machine can demonstrably reach, with the evidence for each.
+ * Reads the routing table and the last snapshot; probes nothing.
+ */
+export async function discoverAdjacentNetworks(): Promise<AdjacentSubnet[]> {
+  return invoke<AdjacentSubnet[]>("discover_adjacent_networks");
 }
 
 /** Resolves a range to a saved network, creating one when nothing covers it. */

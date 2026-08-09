@@ -4,7 +4,14 @@ import { Fragment, useMemo, useState } from "react";
 import { DeviceDetail } from "./DeviceDetail";
 import { DEVICE_TYPE_META, DeviceTypeBadge, EmptyState, Pill, StatusBadge } from "./ui";
 import { compareIp } from "@/lib/service-labels";
-import { isCertificateEntry, isNewDevice, type Device, type DeviceType, type ScanSnapshot } from "@/lib/types";
+import {
+  isCertificateEntry,
+  isNewDevice,
+  isRoutedScan,
+  type Device,
+  type DeviceType,
+  type ScanSnapshot,
+} from "@/lib/types";
 
 type SortKey = "ip" | "name" | "vendor" | "ports" | "type";
 
@@ -14,6 +21,9 @@ export function DeviceTable({ snapshot }: { snapshot: ScanSnapshot }) {
   const [sortKey, setSortKey] = useState<SortKey>("ip");
   const [ascending, setAscending] = useState(true);
   const [expanded, setExpanded] = useState<string | null>(null);
+
+  // Every device of a routed scan is off-link; that is the scan, not news.
+  const routed = isRoutedScan(snapshot);
 
   const typeCounts = useMemo(() => {
     const counts = new Map<DeviceType, number>();
@@ -164,7 +174,13 @@ export function DeviceTable({ snapshot }: { snapshot: ScanSnapshot }) {
                           {device.isGateway && <StatusBadge tone="good" label="Gateway" />}
                           {device.isSelf && <StatusBadge tone="neutral" label="This machine" />}
                           {isNew(device) && <StatusBadge tone="warning" label="New" />}
-                          {device.offSubnet && <StatusBadge tone="warning" label="Off-subnet" />}
+                          {/* When the whole scan was routed this is true of
+                              every row and says nothing; the card states it
+                              once instead. It earns a chip only when it is
+                              genuinely the odd one out. */}
+                          {device.offSubnet && !routed && (
+                            <StatusBadge tone="warning" label="Off-subnet" />
+                          )}
                         </div>
                         {device.hostnames.length > 0 && device.hostnames[0] !== device.displayName && (
                           <p className="mt-0.5 font-mono text-xs" style={{ color: "var(--text-muted)" }}>

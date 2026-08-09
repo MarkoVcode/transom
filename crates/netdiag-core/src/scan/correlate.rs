@@ -10,6 +10,7 @@ use crate::oui::lookup_vendor;
 use crate::types::{
     Banner, Device, DeviceType, MdnsService, NetbiosResult, PortInfo, ScanTarget, SsdpRecord,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
@@ -28,7 +29,32 @@ pub struct CorrelateInput {
     /// This machine's own addresses never appear in its own ARP table.
     pub self_macs: HashMap<Ipv4Addr, String>,
     pub targets: Vec<ScanTarget>,
+    /// Subnets this machine is actually attached to — its own interfaces, not
+    /// the scan's targets. Decides `off_subnet`, which is about whether a MAC
+    /// could ever have been resolved, not about what was scanned.
     pub local_cidrs: Vec<String>,
+}
+
+/// An address that answered but lies outside every scan target.
+///
+/// mDNS is multicast and controllers commonly reflect it between VLANs, so a
+/// scan hears from addresses it never chose to look at. Those are not this
+/// network's devices and must not enter its history — but they are hard proof
+/// that another subnet is reachable, which is exactly what
+/// [`crate::adjacent`] is looking for. Kept here rather than discarded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OffScopeSighting {
+    pub ip: String,
+    /// How it made itself known — `mdns`, `ssdp`.
+    pub sources: Vec<String>,
+}
+
+/// What [`correlate`] produced: this network's devices, and everything it heard
+/// from outside them.
+pub struct Correlated {
+    pub devices: Vec<Device>,
+    pub off_scope: Vec<OffScopeSighting>,
 }
 
 /// Vendor substrings that reliably imply a device class.
@@ -308,9 +334,10 @@ fn choose_display_name(device: &Device, vendor: Option<&str>) -> String {
     }
 }
 
-pub fn correlate(input: CorrelateInput) -> Vec<Device> {
+pub fn correlate(input: CorrelateInput) -> Correlated {
     let now = chrono::Utc::now().to_rfc3339();
     let mut devices: HashMap<Ipv4Addr, Device> = HashMap::new();
+    let mut off_scope: HashMap<Ipv4Addr, Vec<String>> = HashMap::new();
 
     let local_cidrs: Vec<_> = input
         .local_cidrs
@@ -318,7 +345,37 @@ pub fn correlate(input: CorrelateInput) -> Vec<Device> {
         .filter_map(|c| parse_cidr(c).ok())
         .collect();
 
-    let ensure = |devices: &mut HashMap<Ipv4Addr, Device>, ip: Ipv4Addr, source: &str| {
+    let target_cidrs: Vec<_> = input
+        .targets
+        .iter()
+        .filter_map(|target| parse_cidr(&target.cidr).ok())
+        .collect();
+
+    /* A scan belongs to one network, so its results must contain that network
+     * and nothing else. The sweep and the port scan are confined to the targets
+     * by construction; mDNS and SSDP are not — they are announcements, and a
+     * controller reflecting mDNS between VLANs delivers other networks'
+     * devices straight into this one's history. Everything therefore passes
+     * through this gate, and what it turns away is remembered rather than
+     * dropped. */
+    let in_scope = |ip: Ipv4Addr| -> bool {
+        // No targets at all is not a reason to discard everything; it means the
+        // caller did not confine the scan, so nothing is out of scope.
+        target_cidrs.is_empty() || target_cidrs.iter().any(|cidr| cidr.contains(ip))
+    };
+
+    let ensure = |devices: &mut HashMap<Ipv4Addr, Device>,
+                  off_scope: &mut HashMap<Ipv4Addr, Vec<String>>,
+                  ip: Ipv4Addr,
+                  source: &str| {
+        if !in_scope(ip) {
+            let sources = off_scope.entry(ip).or_default();
+            if !sources.iter().any(|s| s == source) {
+                sources.push(source.to_string());
+            }
+            return;
+        }
+
         let device = devices.entry(ip).or_insert_with(|| Device {
             ip: ip.to_string(),
             mac: None,
@@ -367,7 +424,7 @@ pub fn correlate(input: CorrelateInput) -> Vec<Device> {
     };
 
     for (ip, latency) in &input.alive {
-        ensure(&mut devices, *ip, "icmp");
+        ensure(&mut devices, &mut off_scope, *ip, "icmp");
         if let Some(device) = devices.get_mut(ip) {
             device.responded_to_ping = true;
             device.latency_ms = *latency;
@@ -376,11 +433,11 @@ pub fn correlate(input: CorrelateInput) -> Vec<Device> {
 
     // A refused TCP connection proves the host is up even though it ignored ICMP.
     for ip in &input.refused_hosts {
-        ensure(&mut devices, *ip, "tcp-refused");
+        ensure(&mut devices, &mut off_scope, *ip, "tcp-refused");
     }
 
     for (ip, ports) in &input.open_ports {
-        ensure(&mut devices, *ip, "tcp");
+        ensure(&mut devices, &mut off_scope, *ip, "tcp");
         if let Some(device) = devices.get_mut(ip) {
             device.ports.clone_from(ports);
         }
@@ -409,7 +466,7 @@ pub fn correlate(input: CorrelateInput) -> Vec<Device> {
         else {
             continue;
         };
-        ensure(&mut devices, address, "mdns");
+        ensure(&mut devices, &mut off_scope, address, "mdns");
         if let Some(device) = devices.get_mut(&address) {
             device.mdns.push(service.clone());
             if let Some(hostname) = &service.hostname {
@@ -425,14 +482,14 @@ pub fn correlate(input: CorrelateInput) -> Vec<Device> {
         let Ok(ip) = ip_text.parse::<Ipv4Addr>() else {
             continue;
         };
-        ensure(&mut devices, ip, "ssdp");
+        ensure(&mut devices, &mut off_scope, ip, "ssdp");
         if let Some(device) = devices.get_mut(&ip) {
             device.ssdp.clone_from(records);
         }
     }
 
     for (ip, result) in &input.netbios {
-        ensure(&mut devices, *ip, "netbios");
+        ensure(&mut devices, &mut off_scope, *ip, "netbios");
         if let Some(device) = devices.get_mut(ip) {
             for name in &result.names {
                 if !device.hostnames.contains(name) {
@@ -531,12 +588,31 @@ pub fn correlate(input: CorrelateInput) -> Vec<Device> {
             })
     });
 
-    list
+    let mut off_scope: Vec<OffScopeSighting> = off_scope
+        .into_iter()
+        .map(|(ip, sources)| OffScopeSighting {
+            ip: ip.to_string(),
+            sources,
+        })
+        .collect();
+    off_scope.sort_by_key(|sighting| {
+        sighting
+            .ip
+            .parse::<Ipv4Addr>()
+            .map(u32::from)
+            .unwrap_or_default()
+    });
+
+    Correlated {
+        devices: list,
+        off_scope,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::TargetSource;
     use std::collections::BTreeMap;
 
     fn base_input() -> CorrelateInput {
@@ -558,6 +634,110 @@ mod tests {
         }
     }
 
+    fn target(cidr: &str, source: TargetSource) -> ScanTarget {
+        ScanTarget {
+            cidr: cidr.into(),
+            source,
+            host_count: 254,
+            note: None,
+        }
+    }
+
+    fn announcement(name: &str, ip: &str) -> MdnsService {
+        MdnsService {
+            service_type: "_esphomelib._tcp".into(),
+            name: name.into(),
+            hostname: Some(format!("{name}.local")),
+            port: Some(6053),
+            address: Some(ip.to_string()),
+            txt: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn an_announcement_from_outside_the_scan_never_becomes_a_device() {
+        // The reported leak: scanning 10.0.107.0/24 still hears the local LAN's
+        // mDNS — controllers reflect it between VLANs — and filed six 10.0.3.x
+        // hosts into the routed network's history.
+        let mut input = base_input();
+        input.targets = vec![target("10.0.107.0/24", TargetSource::Manual)];
+        input.mdns.push(announcement("kot-sensors-01", "10.0.3.13"));
+        input
+            .mdns
+            .push(announcement("homeassistant", "10.0.107.110"));
+
+        let result = correlate(input);
+
+        assert_eq!(
+            result
+                .devices
+                .iter()
+                .map(|device| device.ip.as_str())
+                .collect::<Vec<_>>(),
+            vec!["10.0.107.110"],
+            "only addresses the scan actually chose may become devices"
+        );
+        assert_eq!(
+            result
+                .off_scope
+                .iter()
+                .map(|sighting| sighting.ip.as_str())
+                .collect::<Vec<_>>(),
+            vec!["10.0.3.13"],
+            "and the rest is kept as evidence of a neighbouring subnet"
+        );
+        assert_eq!(result.off_scope[0].sources, vec!["mdns".to_string()]);
+    }
+
+    #[test]
+    fn a_scan_with_no_targets_is_unconfined_rather_than_empty() {
+        // Callers that do not confine a scan must not silently get nothing.
+        let mut input = base_input();
+        input.targets = Vec::new();
+        input.mdns.push(announcement("anything", "192.168.50.4"));
+
+        let result = correlate(input);
+        assert_eq!(result.devices.len(), 1);
+        assert!(result.off_scope.is_empty());
+    }
+
+    #[test]
+    fn a_routed_target_is_in_scope_but_still_off_the_local_link() {
+        // Both flags are true here and they mean different things: the device
+        // was asked for, and no MAC could ever be resolved for it. Deriving
+        // `off_subnet` from `TargetSource::Local` conflated the two and flagged
+        // every device of a routed scan as unexpected.
+        let mut input = base_input();
+        input.local_cidrs = vec!["10.0.3.0/24".into()];
+        input.targets = vec![target("10.0.107.0/24", TargetSource::Manual)];
+        input
+            .alive
+            .insert("10.0.107.110".parse().unwrap(), Some(4.2));
+
+        let result = correlate(input);
+        assert_eq!(result.devices.len(), 1);
+        assert!(
+            result.devices[0].off_subnet,
+            "it is genuinely not on a link we are attached to"
+        );
+        assert_eq!(
+            result.devices[0].source_range.as_deref(),
+            Some("10.0.107.0/24"),
+            "every device belongs to a target it was found in"
+        );
+    }
+
+    #[test]
+    fn a_device_on_the_local_link_is_not_flagged_off_subnet() {
+        let mut input = base_input();
+        input.local_cidrs = vec!["10.0.3.0/24".into()];
+        input.targets = vec![target("10.0.3.0/24", TargetSource::Local)];
+        input.alive.insert("10.0.3.22".parse().unwrap(), Some(1.1));
+
+        let result = correlate(input);
+        assert!(!result.devices[0].off_subnet);
+    }
+
     #[test]
     fn identifies_the_gateway_from_the_routing_table_not_inference() {
         let ip: Ipv4Addr = "10.0.3.1".parse().unwrap();
@@ -566,7 +746,7 @@ mod tests {
         input.alive.insert(ip, Some(1.8));
         input.neighbors.insert(ip, "e0:63:da:82:1b:35".into());
 
-        let devices = correlate(input);
+        let devices = correlate(input).devices;
         let gateway = &devices[0];
         assert!(gateway.is_gateway);
         assert_eq!(gateway.device_type, DeviceType::Router);
@@ -604,7 +784,7 @@ mod tests {
             txt,
         });
 
-        let devices = correlate(input);
+        let devices = correlate(input).devices;
         let device = devices.iter().find(|d| d.ip == "10.0.3.22").unwrap();
 
         assert_eq!(device.display_name, "sterownik");
@@ -624,7 +804,7 @@ mod tests {
         input.alive.insert(ip, None);
         input.neighbors.insert(ip, "ca:3a:94:02:94:de".into());
 
-        let devices = correlate(input);
+        let devices = correlate(input).devices;
         let device = &devices[0];
         assert_eq!(device.mac_randomized, Some(true));
         assert!(device.vendor.is_none());
@@ -638,7 +818,7 @@ mod tests {
             .neighbors
             .insert("10.0.3.99".parse().unwrap(), "aa:bb:cc:dd:ee:ff".into());
 
-        let devices = correlate(input);
+        let devices = correlate(input).devices;
         assert!(
             devices.is_empty(),
             "a MAC alone is not proof a host is present"
@@ -659,7 +839,7 @@ mod tests {
             }],
         );
 
-        let devices = correlate(input);
+        let devices = correlate(input).devices;
         let device = &devices[0];
         assert!(device.off_subnet, "10.0.107.110 is outside 10.0.3.0/24");
         assert_eq!(device.device_type, DeviceType::Server);
@@ -673,7 +853,7 @@ mod tests {
         input.self_ips.push(ip);
         input.self_macs.insert(ip, "3c:58:c2:52:29:84".into());
 
-        let devices = correlate(input);
+        let devices = correlate(input).devices;
         let device = &devices[0];
         assert!(device.is_self);
         assert_eq!(device.device_type, DeviceType::Computer);
@@ -686,7 +866,7 @@ mod tests {
         let mut input = base_input();
         input.refused_hosts.push(ip);
 
-        let devices = correlate(input);
+        let devices = correlate(input).devices;
         assert_eq!(devices.len(), 1);
         assert!(!devices[0].responded_to_ping);
         assert!(devices[0]

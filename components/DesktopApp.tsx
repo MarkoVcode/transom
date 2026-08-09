@@ -16,6 +16,7 @@ import { UpdateGate } from "./UpdateDialog";
 import { NetworkPrompt, NetworkSwitcher } from "./NetworkSwitcher";
 import { NetworksPanel } from "./NetworksPanel";
 import { NetworkDiscovery } from "./NetworkDiscovery";
+import { AdjacentNotice } from "./AdjacentNetworks";
 import { SignalMeter } from "./charts";
 import {
   Button,
@@ -34,6 +35,8 @@ import {
 import * as api from "@/lib/api";
 import {
   isNewDevice,
+  isRoutedScan,
+  type AdjacentSubnet,
   type Detection,
   type DiscoveredNetwork,
   type NetworkList,
@@ -105,8 +108,50 @@ export function DesktopApp() {
    * back. These two say which it is. */
   const [booted, setBooted] = useState(false);
   const [snapshotLoading, setSnapshotLoading] = useState(false);
+  const [adjacent, setAdjacent] = useState<AdjacentSubnet[] | null>(null);
+  /* What the running scan is actually doing. Separate from `activeNetwork`,
+   * which is only what the user is looking at — conflating them made a scan
+   * relabel itself the moment the user browsed elsewhere. */
+  const [scanningNetwork, setScanningNetwork] = useState<{
+    id?: string;
+    name?: string;
+  } | null>(null);
+  /* A scan that finished under a network the user had navigated away from.
+   * Its results are not on screen and must not be forced there, but silently
+   * finishing is how a scan looks like it did nothing. */
+  const [finishedElsewhere, setFinishedElsewhere] = useState<{
+    id: string;
+    name?: string;
+  } | null>(null);
+  /* Subnets the user has said "not now" to. Held for the session only: a scan
+   * that keeps seeing one is not new information, but a fresh launch is a fair
+   * moment to mention it again. */
+  const [dismissedSubnets, setDismissedSubnets] = useState<string[]>([]);
 
   const mounted = useRef(true);
+  /* The event subscription is set up once and must not be torn down on every
+   * switch, so it reads the selection through a ref rather than closing over a
+   * stale value. */
+  const activeNetworkRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    activeNetworkRef.current = activeNetwork;
+  }, [activeNetwork]);
+
+  /**
+   * Neighbouring subnets the last scan proved reachable.
+   *
+   * Read here rather than inside the Networks page so the finding can be
+   * surfaced where the user is — a suggestion nobody sees until they go looking
+   * for it is not a suggestion.
+   */
+  const refreshAdjacent = useCallback(async () => {
+    try {
+      const found = await api.discoverAdjacentNetworks();
+      if (mounted.current) setAdjacent(found);
+    } catch {
+      // Informational; a failure leaves the previous list alone.
+    }
+  }, []);
 
   const loadSnapshot = useCallback(async (id: string) => {
     setSnapshotLoading(true);
@@ -131,6 +176,11 @@ export function DesktopApp() {
       setRunning(status.running);
       setAutoRepeat(status.autoRepeat);
       if (status.phases.length) setPhases(status.phases);
+      setScanningNetwork(
+        status.running
+          ? { id: status.scanningNetworkId, name: status.scanningNetworkName }
+          : null,
+      );
 
       if (!status.lastSnapshotId) {
         setSnapshot(null);
@@ -188,6 +238,7 @@ export function DesktopApp() {
     async (id: string) => {
       setSnapshot(null);
       setSnapshotLoading(true);
+      setFinishedElsewhere((pending) => (pending?.id === id ? null : pending));
       try {
         await api.switchNetwork(id);
         setActiveNetwork(id);
@@ -271,11 +322,24 @@ export function DesktopApp() {
     };
   }, [reloadSnapshot, refreshDoctor, refreshNetworks, syncScanRange]);
 
+  // Re-read after every scan and on every switch: the evidence comes from the
+  // selected network's newest snapshot, so both change the answer.
+  useEffect(() => {
+    if (!api.isDesktop()) return;
+    (async () => {
+      await refreshAdjacent();
+    })();
+  }, [refreshAdjacent, refreshToken, activeNetwork]);
+
   // What "Run scan" would sweep, shown under the button so the target is never
   // a mystery. Debounced because it re-runs as the extra-range field is typed;
   // refreshed on refreshToken so a completed scan or network switch updates it.
   useEffect(() => {
     if (!api.isDesktop()) return;
+    // Frozen while a scan runs: the dock shows these as what is *being* swept,
+    // and re-reading them on a network switch rewrote a running scan's target
+    // to the newly selected network's range.
+    if (running) return;
     const timer = setTimeout(async () => {
       try {
         const targets = await api.previewScanTargets(extraRange.trim() ? [extraRange.trim()] : []);
@@ -285,7 +349,7 @@ export function DesktopApp() {
       }
     }, 350);
     return () => clearTimeout(timer);
-  }, [extraRange, refreshToken, activeNetwork]);
+  }, [extraRange, refreshToken, activeNetwork, running]);
 
   // Live progress. Subscribed once for the app's lifetime, so a run started by
   // the auto-repeat timer streams here too.
@@ -299,6 +363,7 @@ export function DesktopApp() {
           case "phase":
             setRunning(true);
             setPhases(event.phases);
+            setScanningNetwork({ id: event.networkId, name: event.networkName });
             break;
           case "networkChanged":
             // Only fires when nothing was selected and the scan had to be filed
@@ -310,15 +375,29 @@ export function DesktopApp() {
             break;
           case "done":
             setRunning(false);
+            setScanningNetwork(null);
             setRefreshToken((token) => token + 1);
-            loadSnapshot(event.snapshotId);
+            // The result belongs to the network that was scanned. Loading it
+            // while looking at another one asks its store for an id that is not
+            // there, and the result silently disappears.
+            if (!event.networkId || event.networkId === activeNetworkRef.current) {
+              loadSnapshot(event.snapshotId);
+            } else {
+              setFinishedElsewhere({ id: event.networkId, name: event.networkName });
+            }
+            // The scan count and last-seen time live in the index, which the
+            // switcher renders from — without this it kept reading "0 scans"
+            // beside a freshly-filled device list.
+            refreshNetworks();
             break;
           case "error":
             setRunning(false);
+            setScanningNetwork(null);
             setError(event.message);
             break;
           case "cancelled":
             setRunning(false);
+            setScanningNetwork(null);
             break;
           case "warning":
             break;
@@ -349,18 +428,34 @@ export function DesktopApp() {
         if (mounted.current && profile.id !== activeNetwork) {
           setActiveNetwork(profile.id);
           syncScanRange(list.networks, profile.id);
+          // The loaded snapshot belongs to the network just left. Keeping it on
+          // screen labelled the page with another network's devices and ranges
+          // for the length of the scan — a network showing "0 scans" in the
+          // switcher while listing 29 of them.
+          setSnapshot(null);
         }
       }
-      const id = await api.startScan({
+      // Resolves only when the whole scan has finished, and the result is
+      // handled by the `done` event rather than here. Loading it here as well
+      // was a second path to the same job that did not know which network the
+      // user was looking at: after browsing elsewhere mid-scan it asked that
+      // network's store for an id belonging to the scanned one, got nothing,
+      // and cleared the page.
+      await api.startScan({
         portProfile,
         extraRanges: range ? [range] : [],
       });
-      await loadSnapshot(id);
-      setRefreshToken((token) => token + 1);
     } catch (err) {
       setError(String(err));
     } finally {
-      setRunning(false);
+      // Safe here rather than premature: the command only resolves once the run
+      // is over, including the controller step. It is a backstop for the case
+      // where the command rejects outright — "a scan is already running" — and
+      // no event is emitted at all.
+      if (mounted.current) {
+        setRunning(false);
+        setScanningNetwork(null);
+      }
     }
   };
 
@@ -398,6 +493,30 @@ export function DesktopApp() {
   const activePhase = phases.find((p) => p.status === "running");
   const activeProfile = networks.find((network) => network.id === activeNetwork);
 
+  /* Everything about the scan is labelled from here, never from the selection.
+   * When they differ the user has navigated away mid-scan, which is allowed —
+   * and is exactly when saying "scanning <selected network>" would be a lie. */
+  const scanLabel =
+    scanningNetwork?.name ??
+    networks.find((network) => network.id === scanningNetwork?.id)?.name;
+  const viewingElsewhere =
+    running && !!scanningNetwork?.id && scanningNetwork.id !== activeNetwork;
+
+  /* What the docked strip holds. Rendered only when it has something to say —
+   * an empty sticky wrapper would still reserve its padding and push the page
+   * down by a band of nothing. */
+  const showScanNotice = running && section !== "setup";
+  const showFinishedNotice = !running && !!finishedElsewhere && section !== "setup";
+  const docked = !!error || showScanNotice || showFinishedNotice;
+
+  const untrackedSubnets = useMemo(
+    () => (adjacent ?? []).filter((subnet) => !subnet.alreadyTracked),
+    [adjacent],
+  );
+  const noticeSubnets = untrackedSubnets.filter(
+    (subnet) => !dismissedSubnets.includes(subnet.cidr),
+  );
+
   /* Everything network-scoped is unreadable until the first load settles, so one
    * flag covers the lot rather than each panel inventing its own. */
   const contentLoading = !booted || snapshotLoading;
@@ -408,7 +527,13 @@ export function DesktopApp() {
       (snapshot?.reconciliation?.shadow.length ?? 0) +
       (snapshot?.reconciliation?.identityConflicts.length ?? 0);
     const badgeCount =
-      item.id === "setup" ? problemCount : item.id === "controller" ? findings : 0;
+      item.id === "setup"
+        ? problemCount
+        : item.id === "controller"
+          ? findings
+          : item.id === "networks"
+            ? untrackedSubnets.length
+            : 0;
     const badge = badgeCount > 0;
 
     return (
@@ -456,9 +581,14 @@ export function DesktopApp() {
         <NetworkDiscovery
           candidates={discovery}
           onDone={async () => {
+            // Reopenable from the Networks page, where a snapshot is already on
+            // screen — and adopting a subnet here selects a different network,
+            // so that snapshot is no longer this network's.
             setDiscovery(null);
+            setSnapshot(null);
             const list = await refreshNetworks();
             syncScanRange(list.networks, list.active);
+            await reloadSnapshot();
             setRefreshToken((token) => token + 1);
           }}
           onSkip={() => setDiscovery(null)}
@@ -526,7 +656,7 @@ export function DesktopApp() {
             always visible (the sidebar never scrolls away), stage by stage. */}
         <div className="border-t p-3" style={{ borderColor: "var(--border)" }}>
           {running ? (
-            <ScanDock phases={phases} targets={scanTargets} />
+            <ScanDock phases={phases} targets={scanTargets} networkName={scanLabel} />
           ) : (
             <>
               <Button
@@ -556,15 +686,63 @@ export function DesktopApp() {
       {/* ---------------------------------------------------------- main area */}
       <div className="flex min-w-0 flex-1 flex-col">
         <main className="min-w-0 flex-1 overflow-y-auto px-6 py-5">
-          {error && (
+          {/* Live status stays put while the content scrolls under it.
+              A scan takes a minute or two and these lines say what the app is
+              doing right now — scrolling a long device list must not be a way
+              to lose sight of that. The negative margins let the strip span the
+              full width so nothing shows through beside it. */}
+          {docked && (
             <div
-              className="mb-4 flex items-start justify-between gap-3 rounded-lg border px-3 py-2 text-sm"
-              style={{ borderColor: "var(--status-critical)", color: "var(--status-critical)" }}
+              /* `pb-px` is load-bearing: without a bottom padding the last
+                 notice's margin collapses through the wrapper, so the
+                 background stops short and content scrolls visibly through the
+                 gap beneath it. */
+              className="sticky top-0 z-20 -mx-6 -mt-5 px-6 pb-px pt-5"
+              style={{ background: "var(--surface-page)" }}
             >
-              <span className="min-w-0">{error}</span>
-              <button type="button" onClick={() => setError(null)} aria-label="Dismiss">
-                ✕
-              </button>
+              {error && (
+                <div
+                  className="mb-4 flex items-start justify-between gap-3 rounded-lg border px-3 py-2 text-sm"
+                  style={{
+                    borderColor: "var(--status-critical)",
+                    color: "var(--status-critical)",
+                    background: "var(--surface-1)",
+                  }}
+                >
+                  <span className="min-w-0">{error}</span>
+                  <button type="button" onClick={() => setError(null)} aria-label="Dismiss">
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {showScanNotice && (
+                <ScanNotice
+                  phases={phases}
+                  networkName={scanLabel}
+                  viewingName={viewingElsewhere ? activeProfile?.name : undefined}
+                />
+              )}
+
+              {showFinishedNotice && finishedElsewhere && (
+                <div
+                  role="status"
+                  className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border px-4 py-3"
+                  style={{ borderColor: "var(--status-good)", background: "var(--surface-1)" }}
+                >
+                  <p className="min-w-0 text-sm">
+                    The scan of{" "}
+                    <strong>{finishedElsewhere.name ?? "the other network"}</strong> finished. Its
+                    results are under that network, not this one.
+                  </p>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <Button onClick={() => setFinishedElsewhere(null)}>Dismiss</Button>
+                    <Button variant="primary" onClick={() => changeNetwork(finishedElsewhere.id)}>
+                      View results
+                    </Button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -572,11 +750,19 @@ export function DesktopApp() {
             <CapabilityBanner report={doctor} onOpenSetup={() => setSection("setup")} />
           )}
 
-          {/* Progress is docked in the sidebar, but the content area is where
-              the user is looking and where the results will land — saying so
-              here is what stops a long phase reading as a frozen page. */}
-          {running && section !== "setup" && section !== "networks" && (
-            <ScanNotice phases={phases} networkName={activeProfile?.name} />
+          {/* Where the user is, not where the feature lives. A scan that saw a
+              device on an untracked subnet has discovered something. */}
+          {!running && section !== "networks" && section !== "setup" && (
+            <AdjacentNotice
+              subnets={noticeSubnets}
+              onOpen={() => setSection("networks")}
+              onDismiss={() =>
+                setDismissedSubnets((current) => [
+                  ...current,
+                  ...noticeSubnets.map((subnet) => subnet.cidr),
+                ])
+              }
+            />
           )}
 
           {section === "setup" ? (
@@ -595,6 +781,8 @@ export function DesktopApp() {
             <NetworksPanel
               networks={networks}
               activeId={activeNetwork}
+              adjacent={adjacent}
+              onReloadAdjacent={refreshAdjacent}
               onDiscover={async () => {
                 try {
                   setDiscovery(await api.discoverLocalNetworks());
@@ -645,14 +833,27 @@ export function DesktopApp() {
             </Card>
           ) : !snapshot ? (
             <Card>
-              <EmptyState
-                title="No scan yet"
-                hint={
-                  blocked
-                    ? "Scanning is unavailable until the required capability in Setup & Status is resolved."
-                    : "Run a scan to discover devices, measure connectivity and survey Wi-Fi. A full sweep of a /24 takes roughly 30–90 seconds."
-                }
-              />
+              {running && !viewingElsewhere ? (
+                /* The notice above already says what is happening; telling the
+                   user to run a scan while one is running would contradict it. */
+                <LoadingState
+                  title={
+                    scanLabel
+                      ? `First scan of ${scanLabel} in progress…`
+                      : "First scan in progress…"
+                  }
+                  hint="Devices, connectivity and Wi-Fi appear here as soon as it finishes."
+                />
+              ) : (
+                <EmptyState
+                  title="No scan yet"
+                  hint={
+                    blocked
+                      ? "Scanning is unavailable until the required capability in Setup & Status is resolved."
+                      : "Run a scan to discover devices, measure connectivity and survey Wi-Fi. A full sweep of a /24 takes roughly 30–90 seconds."
+                  }
+                />
+              )}
             </Card>
           ) : (
             <>
@@ -662,9 +863,18 @@ export function DesktopApp() {
               {section === "devices" && (
                 <Card
                   title={`Devices — ${snapshot.devices.length}`}
-                  subtitle={`Scanned ${snapshot.host.scanTargets
-                    .map((t) => t.cidr)
-                    .join(", ")} in ${formatDuration(snapshot.durationMs)}`}
+                  subtitle={
+                    /* ARP is link-local, so a network reached only by routing
+                       can never yield a MAC or a vendor. Said once here rather
+                       than flagged on every row as though it were a surprise. */
+                    `Scanned ${snapshot.host.scanTargets
+                      .map((t) => t.cidr)
+                      .join(", ")} in ${formatDuration(snapshot.durationMs)}${
+                      isRoutedScan(snapshot)
+                        ? " · reached by routing, so hardware addresses and vendors are unavailable"
+                        : ""
+                    }`
+                  }
                 >
                   <DeviceTable snapshot={snapshot} />
                 </Card>
@@ -776,12 +986,25 @@ function controllerPhaseIsRunning(phases: PhaseState[]): boolean {
 function ScanNotice({
   phases,
   networkName,
+  viewingName,
 }: {
   phases: PhaseState[];
+  /** The network being scanned — never the one merely selected. */
   networkName?: string;
+  /** Set only when the user has navigated to a different network mid-scan. */
+  viewingName?: string;
 }) {
   const active = phases.find((phase) => phase.status === "running");
   const controller = controllerPhaseIsRunning(phases);
+
+  const where = networkName ? `Scanning ${networkName}` : "Scanning";
+  const detail = controller
+    ? "Matching this scan's devices against the controller. A controller that is slow to answer can add a minute or more."
+    : active
+      ? `${active.label}${
+          active.progress ? ` — ${active.progress.current} of ${active.progress.total}` : ""
+        }.`
+      : "Starting.";
 
   return (
     <div
@@ -793,22 +1016,15 @@ function ScanNotice({
       <Spinner />
       <div className="min-w-0 text-sm">
         <p className="font-medium">
-          {controller
-            ? "Contacting the UniFi controller…"
-            : networkName
-              ? `Scanning ${networkName}…`
-              : "Scanning…"}
+          {controller ? `${where} — contacting the UniFi controller…` : `${where}…`}
         </p>
         <p className="mt-0.5 text-xs" style={{ color: "var(--text-secondary)" }}>
-          {controller
-            ? "The scan has finished; matching its devices against the controller. A controller that is slow to answer can add a minute or more."
-            : active
-              ? `${active.label}${
-                  active.progress
-                    ? ` — ${active.progress.current} of ${active.progress.total}`
-                    : ""
-                }. This page updates when the scan completes.`
-              : "Starting. This page updates when the scan completes."}
+          {detail}{" "}
+          {viewingName
+            ? `You are viewing ${viewingName}; the results will appear under ${
+                networkName ?? "the scanned network"
+              }.`
+            : "This page updates when the scan completes."}
         </p>
       </div>
     </div>
@@ -849,9 +1065,12 @@ function TargetPreview({ targets }: { targets: ScanTarget[] | null }) {
 function ScanDock({
   phases,
   targets,
+  networkName,
 }: {
   phases: PhaseState[];
   targets: ScanTarget[] | null;
+  /** The network being scanned, pinned for the run. */
+  networkName?: string;
 }) {
   return (
     <div>
@@ -859,8 +1078,14 @@ function ScanDock({
         Cancel scan
       </Button>
 
+      {networkName && (
+        <p className="mt-2 truncate text-[11px] font-medium" title={networkName}>
+          {networkName}
+        </p>
+      )}
+
       {targets !== null && targets.length > 0 && (
-        <p className="mt-2 text-[11px]" style={{ color: "var(--text-secondary)" }}>
+        <p className="mt-1 text-[11px]" style={{ color: "var(--text-secondary)" }}>
           Scanning{" "}
           <span className="font-mono tabular">{targets.map((t) => t.cidr).join(" · ")}</span>
         </p>

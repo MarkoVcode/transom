@@ -8,6 +8,7 @@
 mod credentials;
 
 use netdiag_core::{
+    adjacent,
     doctor::{self, DoctorReport},
     netutil,
     networks::{self, Detection, NetworkIndex, NetworkProfile},
@@ -56,6 +57,25 @@ struct AppState {
     /// Runs the one-time startup work (legacy migration, selecting a network)
     /// exactly once, with every caller awaiting the same completion.
     started: tokio::sync::OnceCell<()>,
+    /// The network the running scan belongs to, for its whole life.
+    ///
+    /// Separate from `active_network` on purpose: the selection is the user's
+    /// current view and may change mid-scan, while this is what the scan is
+    /// actually doing and must not.
+    scanning_network: Mutex<Option<ScanNetwork>>,
+}
+
+/// The network a scan is bound to, resolved once when it starts.
+///
+/// Held by value rather than re-read from `AppState`, because everything after
+/// the run — which controller to correlate against, whose scan counter to bump,
+/// which store to write — used to resolve through the *current* selection. A
+/// switch mid-scan therefore correlated against another network's controller
+/// and credited the scan to it.
+#[derive(Clone)]
+struct ScanNetwork {
+    id: String,
+    name: String,
 }
 
 impl AppState {
@@ -143,6 +163,7 @@ impl AppState {
             }),
             last_snapshot_id: Mutex::new(None),
             started: tokio::sync::OnceCell::new(),
+            scanning_network: Mutex::new(None),
         }
     }
 }
@@ -167,6 +188,105 @@ fn scan_scope(profile: &NetworkProfile, extra_ranges: &[String]) -> Vec<String> 
     scope
 }
 
+fn covers(profile: &NetworkProfile, cidr: &str) -> bool {
+    profile
+        .fingerprint
+        .subnets
+        .iter()
+        .any(|subnet| netutil::cidrs_overlap(subnet, cidr))
+}
+
+/// Exactly what a scan started right now would do.
+///
+/// One function so the sidebar preview and the scan itself cannot disagree.
+/// They did: the preview showed the selected network's subnets plus whatever was
+/// typed, while typing a range the selected network does not cover actually
+/// re-homes the scan to the network that owns that range. The preview therefore
+/// promised to sweep two networks at once — which was the whole thing the user
+/// was trying to avoid.
+struct ScanPlan {
+    /// Subnets the sweep is confined to.
+    scope: Vec<String>,
+    /// Ranges handed to the engine as explicit targets.
+    ///
+    /// Includes every scope subnet this machine is *not* attached to. Without
+    /// that, a network the user reaches only by routing had nothing to sweep:
+    /// the scope filters local interfaces, it never adds a target of its own, so
+    /// selecting a remote network and pressing Run scan swept nothing at all
+    /// unless its range happened to be typed into the form as well.
+    ranges: Vec<String>,
+    /// The network the scan will belong to, when one can be named up front.
+    target: Option<NetworkProfile>,
+}
+
+async fn plan_scan(state: &AppState, extra_ranges: &[String]) -> ScanPlan {
+    let index = NetworkIndex::load(state.settings_root()).await;
+    let active = state
+        .active_network_id()
+        .await
+        .and_then(|id| index.get(&id).cloned());
+    let local: Vec<String> = scan::hostinfo::preview_targets(&[])
+        .into_iter()
+        .map(|target| target.cidr)
+        .collect();
+
+    plan_from(&index, active.as_ref(), extra_ranges, &local)
+}
+
+/// The decision itself, separated from reading the index and enumerating
+/// interfaces so it can be tested without either.
+fn plan_from(
+    index: &NetworkIndex,
+    active: Option<&NetworkProfile>,
+    extra_ranges: &[String],
+    local_subnets: &[String],
+) -> ScanPlan {
+    let normalized: Vec<String> = extra_ranges
+        .iter()
+        .filter_map(|range| scan::hostinfo::validate_range(range).ok())
+        .collect();
+
+    // The selected network owns the scan unless a typed range points elsewhere,
+    // in which case the network that owns that range does — and if none does,
+    // one will be created for exactly it.
+    let target = match active {
+        Some(profile) if normalized.iter().all(|range| covers(profile, range)) => {
+            Some(profile.clone())
+        }
+        _ => normalized.iter().find_map(|range| {
+            index
+                .networks
+                .iter()
+                .find(|profile| covers(profile, range))
+                .cloned()
+        }),
+    };
+
+    let scope = match &target {
+        Some(profile) => scan_scope(profile, &normalized),
+        None => normalized.clone(),
+    };
+
+    let mut ranges = normalized;
+    for subnet in &scope {
+        let attached = local_subnets
+            .iter()
+            .any(|cidr| netutil::cidrs_overlap(cidr, subnet));
+        let already = ranges
+            .iter()
+            .any(|range| netutil::cidrs_overlap(range, subnet));
+        if !attached && !already {
+            ranges.push(subnet.clone());
+        }
+    }
+
+    ScanPlan {
+        scope,
+        ranges,
+        target,
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AutoRepeatState {
@@ -182,6 +302,10 @@ struct ScanStatus {
     phases: Vec<PhaseState>,
     last_snapshot_id: Option<String>,
     auto_repeat: AutoRepeatState,
+    /// The network a running scan belongs to, so a window opened mid-scan
+    /// labels it correctly rather than assuming it is the selected one.
+    scanning_network_id: Option<String>,
+    scanning_network_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -237,40 +361,56 @@ async fn arm_next_run(state: &AppState) {
 /// Creating a network is therefore reserved for the one case with no honest
 /// alternative: nothing is selected at all, so there is nowhere to file the scan.
 ///
-/// Returns the scan scope and warnings to attach to the snapshot.
+/// Returns the network the scan is bound to, its plan, and warnings to attach
+/// to the snapshot.
 async fn resolve_scan_network(
     app: &AppHandle,
     state: &AppState,
     extra_ranges: &[String],
-) -> (Vec<String>, Vec<String>) {
-    if let Some(profile) = state.active_profile().await {
-        let scope = scan_scope(&profile, extra_ranges);
+) -> (Option<ScanNetwork>, ScanPlan, Vec<String>) {
+    if let Some(active) = state.active_profile().await {
+        let plan = plan_scan(state, extra_ranges).await;
         let mut warnings = Vec::new();
 
-        if scope.is_empty() {
+        // A typed range belonging to another saved network re-homes the scan;
+        // `plan_scan` has already decided which, so bind to that rather than to
+        // whatever is merely selected.
+        let bound = plan
+            .target
+            .as_ref()
+            .map(|profile| ScanNetwork {
+                id: profile.id.clone(),
+                name: profile.name.clone(),
+            })
+            .unwrap_or(ScanNetwork {
+                id: active.id.clone(),
+                name: active.name.clone(),
+            });
+        let name = bound.name.clone();
+
+        if plan.scope.is_empty() {
             warnings.push(format!(
-                "\"{}\" has no recorded subnets, so this scan was not confined to it. Use \
-                 \"Refresh fingerprint\" under Networks while on site, or type a range, to scope \
-                 future scans.",
-                profile.name
+                "\"{name}\" has no recorded subnets, so this scan was not confined to it. \
+                 Re-detect it under Networks while on site, or type a range, to scope future \
+                 scans."
             ));
         } else {
             let attached = scan::hostinfo::preview_targets(&[]).iter().any(|target| {
-                scope
+                plan.scope
                     .iter()
                     .any(|subnet| netutil::cidrs_overlap(subnet, &target.cidr))
             });
             if !attached {
                 warnings.push(format!(
-                    "This machine is not attached to any of \"{}\" ({}). Only addresses reachable \
-                     by routing can answer, so the result may be incomplete.",
-                    profile.name,
-                    scope.join(", ")
+                    "This machine is not attached to \"{name}\" ({}); it was reached by routing, \
+                     so devices behind a firewall or on a segment that blocks probes may be \
+                     missing.",
+                    plan.scope.join(", ")
                 ));
             }
         }
 
-        return (scope, warnings);
+        return (Some(bound), plan, warnings);
     }
 
     // Nothing selected: adopt or create a network, because a scan has to be
@@ -306,10 +446,8 @@ async fn resolve_scan_network(
         },
     );
 
-    let scope = index
-        .get(&id)
-        .map(|profile| scan_scope(profile, extra_ranges))
-        .unwrap_or_default();
+    // Planned after the selection, so it describes the network just adopted.
+    let plan = plan_scan(state, extra_ranges).await;
 
     let warning = if created {
         format!(
@@ -320,7 +458,14 @@ async fn resolve_scan_network(
         format!("No network was selected, so the scan was filed under \"{name}\".")
     };
 
-    (scope, vec![warning])
+    (
+        Some(ScanNetwork {
+            id: id.clone(),
+            name: name.clone(),
+        }),
+        plan,
+        vec![warning],
+    )
 }
 
 /// Records and broadcasts a transition of the controller phase.
@@ -331,6 +476,7 @@ async fn resolve_scan_network(
 async fn publish_controller_phase(
     app: &AppHandle,
     state: &AppState,
+    network: Option<&ScanNetwork>,
     phases: &mut [PhaseState],
     status: PhaseStatus,
     detail: Option<String>,
@@ -347,7 +493,14 @@ async fn publish_controller_phase(
 
     let phases = phases.to_vec();
     *state.phases.lock().await = phases.clone();
-    let _ = app.emit(PROGRESS_EVENT, &ScanEvent::Phase { phases });
+    let _ = app.emit(
+        PROGRESS_EVENT,
+        &ScanEvent::Phase {
+            phases,
+            network_id: network.map(|n| n.id.clone()),
+            network_name: network.map(|n| n.name.clone()),
+        },
+    );
 }
 
 /// Runs a scan, streaming progress to the frontend. Shared by the manual button
@@ -367,11 +520,17 @@ async fn execute_scan(
         handle
     };
 
-    // Must precede `state.store()`: the store is bound to whichever network is
-    // active when the scan starts writing, and the scope decides what is swept.
-    let (scope, routing_warnings) = resolve_scan_network(&app, &state, &config.extra_ranges).await;
+    // Resolved once, here, and used for everything that follows: which store to
+    // write, which controller to correlate against, whose counters to bump, and
+    // what the UI is told. The user is free to browse another network while this
+    // runs — nothing below may consult the selection again.
+    let (scan_network, plan, routing_warnings) =
+        resolve_scan_network(&app, &state, &config.extra_ranges).await;
+    *state.scanning_network.lock().await = scan_network.clone();
+
     let mut config = config;
-    config.restrict_to_subnets = scope;
+    config.restrict_to_subnets = plan.scope;
+    config.extra_ranges = plan.ranges;
 
     for message in &routing_warnings {
         let _ = app.emit(
@@ -396,7 +555,14 @@ async fn execute_scan(
     let phase_store = Arc::clone(&state);
     let sender = tx.clone();
 
-    let store = state.store().await;
+    // Bound to the network resolved above, not to `state.store()`, so a switch
+    // mid-scan cannot redirect where the results are written.
+    let store = match &scan_network {
+        Some(network) => Store::new(NetworkIndex::scans_dir(state.settings_root(), &network.id)),
+        None => state.store().await,
+    };
+
+    let event_network = scan_network.clone();
     let result = scan::run_scan(config, &store, handle, move |progress| {
         let event = match progress {
             scan::ScanProgress::Phases(phases) => {
@@ -405,7 +571,11 @@ async fn execute_scan(
                 if let Ok(mut guard) = phase_store.phases.try_lock() {
                     guard.clone_from(&phases);
                 }
-                ScanEvent::Phase { phases }
+                ScanEvent::Phase {
+                    phases,
+                    network_id: event_network.as_ref().map(|n| n.id.clone()),
+                    network_name: event_network.as_ref().map(|n| n.name.clone()),
+                }
             }
             scan::ScanProgress::Warning(message) => ScanEvent::Warning { message },
         };
@@ -429,7 +599,10 @@ async fn execute_scan(
             // degrades to a warning — the scan itself is still valid. Controller
             // settings are per network: a different site has a different
             // controller, or none.
-            let network_root = state.network_root().await;
+            let network_root = match &scan_network {
+                Some(network) => NetworkIndex::network_dir(state.settings_root(), &network.id),
+                None => state.network_root().await,
+            };
             let config = UnifiConfig::load(&network_root)
                 .await
                 .filter(|config| config.is_configured());
@@ -439,6 +612,7 @@ async fn execute_scan(
                     publish_controller_phase(
                         &app,
                         &state,
+                        scan_network.as_ref(),
                         &mut snapshot.phases,
                         PhaseStatus::Skipped,
                         Some("no controller configured for this network".into()),
@@ -449,6 +623,7 @@ async fn execute_scan(
                     publish_controller_phase(
                         &app,
                         &state,
+                        scan_network.as_ref(),
                         &mut snapshot.phases,
                         PhaseStatus::Running,
                         Some(format!("querying {}", config.host)),
@@ -504,6 +679,7 @@ async fn execute_scan(
                     publish_controller_phase(
                         &app,
                         &state,
+                        scan_network.as_ref(),
                         &mut snapshot.phases,
                         status,
                         Some(detail),
@@ -523,17 +699,26 @@ async fn execute_scan(
     // "not running" while it is still working is what made the wait look like a
     // hang.
     *state.running.lock().await = None;
+    *state.scanning_network.lock().await = None;
+
+    let network_id = scan_network.as_ref().map(|network| network.id.clone());
+    let network_name = scan_network.as_ref().map(|network| network.name.clone());
 
     match result {
         Ok(snapshot) => {
-            *state.last_snapshot_id.lock().await = Some(snapshot.id.clone());
+            // Only meaningful for the network just scanned; a switch during the
+            // run makes it the wrong answer for whatever is selected now.
+            if state.active_network_id().await == network_id {
+                *state.last_snapshot_id.lock().await = Some(snapshot.id.clone());
+            }
             *state.phases.lock().await = snapshot.phases.clone();
 
-            // Keep the network index's activity counters honest.
-            if let Some(id) = state.active_network_id().await {
+            // Keep the network index's activity counters honest — for the
+            // network that was scanned, not the one now on screen.
+            if let Some(id) = &network_id {
                 let root = state.settings_root();
                 let mut index = NetworkIndex::load(root).await;
-                if let Some(profile) = index.get_mut(&id) {
+                if let Some(profile) = index.get_mut(id) {
                     profile.scan_count += 1;
                     profile.last_seen_at = Some(snapshot.started_at.clone());
                 }
@@ -543,6 +728,8 @@ async fn execute_scan(
                 PROGRESS_EVENT,
                 &ScanEvent::Done {
                     snapshot_id: snapshot.id.clone(),
+                    network_id,
+                    network_name,
                 },
             );
             arm_next_run(&state).await;
@@ -550,10 +737,11 @@ async fn execute_scan(
         }
         Err(error) => {
             let event = if error.contains("cancelled") {
-                ScanEvent::Cancelled
+                ScanEvent::Cancelled { network_id }
             } else {
                 ScanEvent::Error {
                     message: error.clone(),
+                    network_id,
                 }
             };
             let _ = app.emit(PROGRESS_EVENT, &event);
@@ -615,11 +803,15 @@ async fn get_status(state: State<'_, Arc<AppState>>) -> Result<ScanStatus, Strin
         None => state.store().await.list_ids().await.first().cloned(),
     };
 
+    let scanning = state.scanning_network.lock().await.clone();
+
     Ok(ScanStatus {
         running,
         phases,
         last_snapshot_id,
         auto_repeat: current_auto_repeat(&state).await,
+        scanning_network_id: scanning.as_ref().map(|network| network.id.clone()),
+        scanning_network_name: scanning.as_ref().map(|network| network.name.clone()),
     })
 }
 
@@ -725,6 +917,12 @@ async fn detect_network(state: State<'_, Arc<AppState>>) -> Result<Detection, St
 }
 
 /// Creates a network from what is currently observable and selects it.
+///
+/// This form always fingerprints *here*, whatever it is named. Naming it after a
+/// subnet the machine is not on produced a duplicate of the network it is on,
+/// which then scanned that network instead — so a fingerprint that already
+/// belongs to a saved network is refused, and the user is pointed at the form
+/// that does what they meant.
 #[tauri::command]
 async fn create_network(
     state: State<'_, Arc<AppState>>,
@@ -739,6 +937,20 @@ async fn create_network(
 
     let root = state.settings_root();
     let mut index = NetworkIndex::load(root).await;
+
+    if let Some(existing) = index.networks.iter().find(|profile| {
+        networks::match_strength(&profile.fingerprint, &fingerprint)
+            >= networks::MatchStrength::Strong
+    }) {
+        return Err(format!(
+            "This machine is already on \"{}\" ({}), so a second network created here would be a \
+             copy of it and the two histories would mix. To track a range you are not attached \
+             to, use \"Add a network by address range\" instead.",
+            existing.name,
+            existing.fingerprint.subnets.join(", ")
+        ));
+    }
+
     // Read the profile back rather than returning the one handed in: `add`
     // rewrites the id if it would collide with an existing directory.
     let id = index.add(NetworkProfile::new(name, fingerprint));
@@ -877,13 +1089,10 @@ async fn preview_scan_targets(
     state: State<'_, Arc<AppState>>,
     extra_ranges: Vec<String>,
 ) -> Result<Vec<ScanTarget>, String> {
-    let scope = match state.active_profile().await {
-        Some(profile) => scan_scope(&profile, &extra_ranges),
-        None => Vec::new(),
-    };
+    let plan = plan_scan(&state, &extra_ranges).await;
     Ok(scan::hostinfo::preview_targets_scoped(
-        &extra_ranges,
-        &scope,
+        &plan.ranges,
+        &plan.scope,
     ))
 }
 
@@ -949,6 +1158,72 @@ async fn discover_local_networks(
             }
         })
         .collect())
+}
+
+/// Other subnets this machine can demonstrably reach, and why we think so.
+///
+/// Answers "what else is out there?" — the question confining a scan to one
+/// network raises. Every candidate is backed by proof of reachability, never by
+/// extrapolation from an address; see [`netdiag_core::adjacent`] for where that
+/// line falls and why the prefix is flagged when it is an assumption.
+///
+/// Cheap: the routing table is read live, and everything else is re-read from
+/// the last snapshot. Nothing is probed, so this cannot itself touch a network
+/// the user has not asked about.
+#[tauri::command]
+async fn discover_adjacent_networks(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<adjacent::AdjacentSubnet>, String> {
+    let index = NetworkIndex::load(state.settings_root()).await;
+    let tracked: Vec<String> = index
+        .networks
+        .iter()
+        .flat_map(|profile| profile.fingerprint.subnets.clone())
+        .collect();
+
+    let snapshot = state.store().await.load_latest().await;
+
+    // The live routing table beats the stored one: a VPN or a second NIC may
+    // have come up since the last scan, and a route is the strongest evidence
+    // there is.
+    let (live_host, _warnings) = scan::hostinfo::collect(&[]).await;
+
+    // Scan targets come from the snapshot when there is one, so a subnet that
+    // was already swept is not offered again. Falling back to the live host
+    // keeps the machine's own subnets out of the list before any scan exists.
+    let mut host = live_host;
+    if let Some(snapshot) = &snapshot {
+        host.scan_targets = snapshot.host.scan_targets.clone();
+    }
+
+    let controller_networks = snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.unifi.as_ref())
+        .map(|unifi| {
+            unifi
+                .networks
+                .iter()
+                .filter(|network| network.enabled)
+                .filter_map(|network| {
+                    network
+                        .subnet
+                        .clone()
+                        .map(|subnet| (network.name.clone(), subnet, network.vlan))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(adjacent::discover(&adjacent::Sources {
+        host: Some(&host),
+        connectivity: snapshot.as_ref().map(|snapshot| &snapshot.connectivity),
+        off_scope: snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.off_scope.as_slice())
+            .unwrap_or_default(),
+        controller_networks,
+        tracked,
+    }))
 }
 
 /// Resolves a range to a saved network, creating one when nothing covers it.
@@ -1518,6 +1793,7 @@ pub fn run() {
             clear_network_history,
             preview_scan_targets,
             discover_local_networks,
+            discover_adjacent_networks,
             ensure_network_for_range,
             factory_reset,
             delete_network,
@@ -1600,6 +1876,90 @@ mod tests {
     fn a_public_range_never_enters_the_scope() {
         let scope = scan_scope(&profile(&["10.0.3.0/24"]), &["8.8.8.0/24".into()]);
         assert_eq!(scope, vec!["10.0.3.0/24"]);
+    }
+
+    fn named(name: &str, subnets: &[&str]) -> NetworkProfile {
+        NetworkProfile::new(
+            name,
+            networks::NetworkFingerprint {
+                subnets: subnets.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The machine is on 10.0.3.0/24 throughout, as in the reported case.
+    const LOCAL: [&str; 1] = ["10.0.3.0/24"];
+
+    fn local() -> Vec<String> {
+        LOCAL.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_selected_local_network_sweeps_itself_and_nothing_else() {
+        let mut index = NetworkIndex::default();
+        index.networks.push(named("ADOFULL", &["10.0.3.0/24"]));
+        let active = index.networks[0].clone();
+
+        let plan = plan_from(&index, Some(&active), &[], &local());
+        assert_eq!(plan.scope, vec!["10.0.3.0/24"]);
+        assert!(
+            plan.ranges.is_empty(),
+            "an attached subnet needs no explicit target"
+        );
+    }
+
+    #[test]
+    fn a_selected_remote_network_is_swept_without_typing_its_range() {
+        // The scope only *filters* local interfaces. A network reached by
+        // routing has no local interface to keep, so without an explicit target
+        // pressing Run scan swept nothing at all.
+        let mut index = NetworkIndex::default();
+        index.networks.push(named("Lab", &["10.0.2.0/24"]));
+        let active = index.networks[0].clone();
+
+        let plan = plan_from(&index, Some(&active), &[], &local());
+        assert_eq!(plan.scope, vec!["10.0.2.0/24"]);
+        assert_eq!(
+            plan.ranges,
+            vec!["10.0.2.0/24"],
+            "a remote network must become an explicit target"
+        );
+    }
+
+    #[test]
+    fn a_range_outside_the_selected_network_does_not_sweep_both() {
+        // The reported bug: on ADOFULL (10.0.3.0/24), typing 10.0.2.0/24 showed
+        // "Scans 10.0.3.0/24 · 10.0.2.0/24". Pressing Run scan re-homes to the
+        // network owning that range, so the preview promised a sweep of two
+        // networks that was never going to happen.
+        let mut index = NetworkIndex::default();
+        index.networks.push(named("ADOFULL", &["10.0.3.0/24"]));
+        let active = index.networks[0].clone();
+
+        let plan = plan_from(&index, Some(&active), &["10.0.2.0/24".into()], &local());
+        assert_eq!(plan.scope, vec!["10.0.2.0/24"]);
+        assert_eq!(plan.ranges, vec!["10.0.2.0/24"]);
+        assert!(
+            plan.target.is_none(),
+            "no saved network covers it, so one will be created for exactly it"
+        );
+    }
+
+    #[test]
+    fn a_typed_range_belonging_to_another_network_plans_under_that_network() {
+        let mut index = NetworkIndex::default();
+        index.networks.push(named("ADOFULL", &["10.0.3.0/24"]));
+        index.networks.push(named("Lab", &["10.0.2.0/24"]));
+        let active = index.networks[0].clone();
+
+        let plan = plan_from(&index, Some(&active), &["10.0.2.0/24".into()], &local());
+        assert_eq!(
+            plan.target.as_ref().map(|p| p.name.as_str()),
+            Some("Lab"),
+            "the range decides which network the scan belongs to"
+        );
+        assert_eq!(plan.scope, vec!["10.0.2.0/24"]);
     }
 
     #[test]

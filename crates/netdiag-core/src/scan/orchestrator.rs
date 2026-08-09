@@ -155,6 +155,20 @@ where
         }
     }
 
+    // Taken from the interfaces, not from the targets: this answers "is that
+    // address on a link we are attached to?", which decides whether a MAC could
+    // ever be resolved for it. Deriving it from `TargetSource::Local` instead
+    // made every device of a routed scan — a scan with no local targets at all
+    // — report as off-subnet, including the ones that were asked for.
+    let attached_cidrs: Vec<String> = host
+        .interfaces
+        .iter()
+        .filter(|iface| iface.scannable)
+        .flat_map(|iface| iface.ipv4.iter())
+        .filter_map(|addr| parse_cidr(&format!("{}/{}", addr.address, addr.cidr)).ok())
+        .map(|parsed| parsed.canonical())
+        .collect();
+
     let local_cidrs: Vec<String> = host
         .scan_targets
         .iter()
@@ -461,7 +475,7 @@ where
     /* ----------------------------------------------------- phase: correlate */
     run.start(ScanPhase::Correlate);
 
-    let devices = correlate::correlate(correlate::CorrelateInput {
+    let correlated = correlate::correlate(correlate::CorrelateInput {
         alive: sweep_result.alive,
         neighbors,
         open_ports: port_result.open,
@@ -475,10 +489,24 @@ where
         self_ips,
         self_macs,
         targets: host.scan_targets.clone(),
-        local_cidrs,
+        local_cidrs: attached_cidrs,
     });
+    let correlate::Correlated { devices, off_scope } = correlated;
 
     let device_count = devices.len();
+    if !off_scope.is_empty() {
+        run.warn(format!(
+            "{} address(es) answered from outside this network and were left out of the \
+             results: {}. They are offered under Networks as subnets to track.",
+            off_scope.len(),
+            off_scope
+                .iter()
+                .map(|sighting| sighting.ip.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
     // Close the phase before building the snapshot, or the saved copy records
     // `correlate` as still running forever.
     run.finish(
@@ -501,6 +529,7 @@ where
         warnings: run.warnings.clone(),
         config,
         capabilities: capabilities.capabilities,
+        off_scope,
         // Set by `apply_history` once the previous snapshot is known.
         baseline: false,
         // Populated by the caller when a UniFi controller is configured; the

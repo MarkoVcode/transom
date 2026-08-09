@@ -1,9 +1,10 @@
 "use client";
 
 import { useState } from "react";
+import { AdjacentNetworks } from "./AdjacentNetworks";
 import { Button, Card, EmptyState, Pill, StatusBadge, formatRelativeTime } from "./ui";
 import * as api from "@/lib/api";
-import type { NetworkProfile } from "@/lib/types";
+import type { AdjacentSubnet, NetworkProfile } from "@/lib/types";
 
 /**
  * Managing the tracked networks.
@@ -17,12 +18,17 @@ export function NetworksPanel({
   activeId,
   onChanged,
   onDiscover,
+  adjacent,
+  onReloadAdjacent,
 }: {
   networks: NetworkProfile[];
   activeId?: string;
   onChanged: () => void;
   /** Reopens the first-run picker of currently-visible subnets. */
   onDiscover?: () => void;
+  /** Neighbouring subnets found from evidence; `null` while loading. */
+  adjacent: AdjacentSubnet[] | null;
+  onReloadAdjacent: () => void | Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -31,6 +37,8 @@ export function NetworksPanel({
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState<string | null>(null);
   const [newName, setNewName] = useState("");
+  const [newRange, setNewRange] = useState("");
+  const [rangeName, setRangeName] = useState("");
 
   const run = async (action: () => Promise<unknown>) => {
     setBusy(true);
@@ -304,9 +312,79 @@ export function NetworksPanel({
           </Button>
         </div>
         <p className="mt-2 text-xs" style={{ color: "var(--text-secondary)" }}>
-          The fingerprint is taken from the network this machine is attached to right now.
+          The fingerprint is taken from the network this machine is attached to right now —
+          whatever you call it. For a subnet you are <em>not</em> on, use the form below instead.
         </p>
       </Card>
+
+      {/* The only way to track a network used to be "the one you are on", so a
+          remote subnet could only be named — never actually defined. Naming it
+          after the range produced a copy of the local network, which then got
+          scanned in its place. */}
+      <Card title="Add a network by address range">
+        <div className="flex flex-wrap items-end gap-2">
+          <label className="min-w-48 flex-1">
+            <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+              Name
+            </span>
+            <input
+              type="text"
+              value={rangeName}
+              onChange={(e) => setRangeName(e.target.value)}
+              placeholder="Lab, Guest VLAN, DMZ…"
+              disabled={busy}
+              className="mt-1 w-full rounded-lg border px-2 py-1.5 text-sm"
+              style={{
+                borderColor: "var(--border-strong)",
+                background: "var(--surface-raised)",
+                color: "var(--text-primary)",
+              }}
+            />
+          </label>
+          <label className="min-w-40">
+            <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+              Range
+            </span>
+            <input
+              type="text"
+              value={newRange}
+              onChange={(e) => setNewRange(e.target.value)}
+              placeholder="10.0.2.0/24"
+              disabled={busy}
+              className="mt-1 w-full rounded-lg border px-2 py-1.5 font-mono text-sm"
+              style={{
+                borderColor: "var(--border-strong)",
+                background: "var(--surface-raised)",
+                color: "var(--text-primary)",
+              }}
+            />
+          </label>
+          <Button
+            variant="primary"
+            onClick={() =>
+              run(async () => {
+                await api.ensureNetworkForRange(newRange, rangeName.trim() || undefined);
+                setNewRange("");
+                setRangeName("");
+              })
+            }
+            disabled={busy || !newRange.trim()}
+          >
+            Add
+          </Button>
+        </div>
+        <p className="mt-2 text-xs" style={{ color: "var(--text-secondary)" }}>
+          For a subnet this machine can reach by routing but is not attached to — another VLAN,
+          or a segment across a router. Scans of it sweep that range only, and it becomes the
+          selected network so you can scan it straight away.
+        </p>
+      </Card>
+
+      <AdjacentNetworks
+        subnets={adjacent}
+        onChanged={onChanged}
+        onReload={onReloadAdjacent}
+      />
 
       {activeId && (
         <Card title="Re-detect">

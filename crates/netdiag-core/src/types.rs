@@ -613,6 +613,14 @@ pub struct ScanSnapshot {
     /// Capability report captured at scan time, so a stored snapshot explains
     /// its own gaps rather than being judged against today's environment.
     pub capabilities: Vec<crate::doctor::CapabilityReport>,
+    /// Addresses that answered from outside every scan target.
+    ///
+    /// Not devices of this network and deliberately absent from `devices` — but
+    /// proof that another subnet is reachable, which is what
+    /// [`crate::adjacent`] draws on. Defaulted so snapshots written before this
+    /// existed still load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub off_scope: Vec<crate::scan::correlate::OffScopeSighting>,
 }
 
 /* --------------------------------------------------------------------- diff */
@@ -661,21 +669,39 @@ pub struct SnapshotSummary {
 
 /* --------------------------------------------------------------- scan events */
 
+/// Live scan progress.
+///
+/// Every event names the network the scan belongs to. Without that the UI could
+/// only label a running scan with whatever network happened to be *selected*,
+/// so switching networks mid-scan relabelled the scan in flight — and a result
+/// arriving after a switch was looked up in the wrong store and silently
+/// vanished. The scan's identity travels with its events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ScanEvent {
     #[serde(rename_all = "camelCase")]
-    Phase { phases: Vec<PhaseState> },
+    Phase {
+        phases: Vec<PhaseState>,
+        network_id: Option<String>,
+        network_name: Option<String>,
+    },
     #[serde(rename_all = "camelCase")]
     Warning { message: String },
     /// The scan was filed under a different network than the one selected,
-    /// because that is where the machine actually is.
+    /// because nothing was selected and it had to go somewhere.
     #[serde(rename_all = "camelCase")]
     NetworkChanged { id: String, name: String },
     #[serde(rename_all = "camelCase")]
-    Done { snapshot_id: String },
+    Done {
+        snapshot_id: String,
+        network_id: Option<String>,
+        network_name: Option<String>,
+    },
     #[serde(rename_all = "camelCase")]
-    Error { message: String },
+    Error {
+        message: String,
+        network_id: Option<String>,
+    },
     #[serde(rename_all = "camelCase")]
-    Cancelled,
+    Cancelled { network_id: Option<String> },
 }

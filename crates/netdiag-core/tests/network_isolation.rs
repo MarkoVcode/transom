@@ -110,6 +110,7 @@ fn snapshot(id: &str, device_ips: &[&str]) -> ScanSnapshot {
         warnings: Vec::new(),
         config: ScanConfig::default(),
         capabilities: Vec::new(),
+        off_scope: Vec::new(),
         baseline: false,
         unifi: None,
         reconciliation: None,
