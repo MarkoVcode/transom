@@ -391,7 +391,53 @@ export interface Reconciliation {
   degradedLinks?: DegradedLink[];
   unscannedNetworks?: UnscannedNetwork[];
   flappingClients?: FlappingClient[];
+  /** Faults a healthy link speed hides. Absent on snapshots stored before 1.6. */
+  troubledPorts?: TroubledPort[];
+  saturatedRadios?: SaturatedRadio[];
+  loadedDevices?: LoadedDevice[];
+  meshedAccessPoints?: MeshedAccessPoint[];
   summary: string;
+}
+
+/**
+ * A live port that is half duplex, dropping frames, or blocked by spanning
+ * tree — none of which shows in its negotiated speed.
+ */
+export interface TroubledPort {
+  switchName: string;
+  port: number;
+  portName?: string;
+  speedMbps: number;
+  halfDuplex: boolean;
+  errors: number;
+  drops: number;
+  stpBlocking: boolean;
+}
+
+/** A radio whose airtime is close to spent — a whole-cell cause. */
+export interface SaturatedRadio {
+  accessPoint: string;
+  band: string;
+  utilisationPercent: number;
+  /** Airtime this radio is not responsible for: neighbours, or a legacy client. */
+  interferencePercent?: number;
+  clients: number;
+}
+
+/** A managed device under sustained CPU load. */
+export interface LoadedDevice {
+  device: string;
+  role: string;
+  cpuPercent: number;
+  memPercent?: number;
+}
+
+/** An access point reaching the network over a wireless backhaul. */
+export interface MeshedAccessPoint {
+  accessPoint: string;
+  rssi?: number;
+  speedMbps?: number;
+  maxSpeedMbps?: number;
 }
 
 /* ------------------------------------------------------------------ networks */
@@ -442,6 +488,17 @@ export interface AdjacentSubnet {
   summary: string;
 }
 
+/**
+ * A named place several networks belong to — a site, a building, a client.
+ *
+ * Identified by id, never by name: renaming propagates because nothing stores
+ * the name, and two spellings of one place cannot become two groups.
+ */
+export interface Location {
+  id: string;
+  name: string;
+}
+
 export interface NetworkProfile {
   id: string;
   name: string;
@@ -449,6 +506,8 @@ export interface NetworkProfile {
   createdAt: string;
   lastSeenAt?: string;
   scanCount: number;
+  /** The location this network belongs to, if any. */
+  locationId?: string;
   /** A UniFi controller is configured for this network. Set by list_networks. */
   hasUnifi?: boolean;
 }
@@ -469,8 +528,133 @@ export type Detection =
 
 export interface NetworkList {
   active?: string;
+  /** Already sorted for display by the engine. */
+  locations: Location[];
   networks: NetworkProfile[];
 }
+
+/* ----------------------------------------------------------------- assistant */
+
+/** Where the model runs. */
+export type ProviderKind = "anthropic" | "ollama";
+
+/**
+ * Assistant settings. Stored per installation, not per network — which model
+ * to use is about this machine, not the site being diagnosed.
+ *
+ * The API key is never part of this: it lives in the OS keychain, the same
+ * separation the controller password uses.
+ */
+export interface AssistConfig {
+  provider: ProviderKind;
+  /** Overrides the backend's default model. */
+  model?: string;
+  /** Ollama's base URL. Ignored by the cloud provider. */
+  endpoint?: string;
+  /** Replace MACs, hostnames and SSIDs with placeholders before sending. */
+  redact: boolean;
+  enabled: boolean;
+}
+
+/** Settings plus whether a key is on file — the key itself never comes back. */
+export interface AssistSettings extends AssistConfig {
+  hasKey: boolean;
+}
+
+/* --------------------------------------------------------------------- cases */
+
+export type CaseStatus = "running" | "waitingForAnswer" | "done" | "cancelled" | "failed";
+
+export type Confidence = "low" | "medium" | "high";
+
+/**
+ * One measurement the assistant took, kept so a conclusion can point at it.
+ *
+ * Every number the assistant states traces back to one of these. A claim with
+ * no evidence behind it is rejected before it reaches the UI.
+ */
+export interface Evidence {
+  id: string;
+  tool: string;
+  summary: string;
+  detail: unknown;
+  recordedAt: string;
+}
+
+export interface Finding {
+  title: string;
+  detail: string;
+  evidenceIds: string[];
+}
+
+export interface Remedy {
+  title: string;
+  rationale: string;
+  /** Steps for the user to carry out — the assistant changes nothing itself. */
+  steps: string[];
+  evidenceIds: string[];
+  confidence: Confidence;
+  /** Whether following the steps is easy to undo. */
+  reversible: boolean;
+}
+
+export interface CaseQuestion {
+  text: string;
+  /** Offered answers. Empty means free text. */
+  choices: string[];
+}
+
+/** One turn of the model conversation, as stored. */
+export type CaseMessage =
+  | { type: "user"; text: string }
+  | { type: "assistant"; text?: string; toolCalls?: { id: string; name: string; input: unknown }[] }
+  | { type: "toolResult"; callId: string; name: string; content: string; isError: boolean };
+
+export interface TroubleshootingCase {
+  id: string;
+  networkId: string;
+  symptom: string;
+  createdAt: string;
+  updatedAt: string;
+  status: CaseStatus;
+  transcript: CaseMessage[];
+  evidence: Evidence[];
+  findings: Finding[];
+  remedy?: Remedy;
+  /** Set only while waiting for an answer. */
+  question?: CaseQuestion;
+  /** Why it stopped, when a remedy was not reached. */
+  note?: string;
+  usage: { inputTokens: number; outputTokens: number };
+  steps: number;
+}
+
+export interface CaseSummary {
+  id: string;
+  symptom: string;
+  status: CaseStatus;
+  createdAt: string;
+  remedyTitle?: string;
+  findingCount: number;
+}
+
+/**
+ * Live progress from a running diagnosis.
+ *
+ * Carries the case and network it belongs to for the same reason `ScanEvent`
+ * does: labelling progress with whatever is *selected* mislabels everything the
+ * moment the user switches network mid-run.
+ */
+export type AssistEvent = { caseId: string; networkId: string } & (
+  | { type: "said"; text: string }
+  | { type: "toolStarted"; name: string }
+  | { type: "toolFinished"; name: string; summary: string; isError: boolean }
+  | { type: "reproduceNow"; seconds: number; reason: string }
+  | { type: "asked"; question: CaseQuestion }
+  | { type: "finding"; title: string }
+  | { type: "remedy"; title: string }
+  | { type: "finished"; status: CaseStatus; note?: string }
+);
 
 /* -------------------------------------------------------------------- update */
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Button, Card, EmptyState, LoadingState, Pill, StatusBadge } from "./ui";
+import { Button, Card, EmptyState, Icon, type IconName, LoadingState, Pill, StatusBadge } from "./ui";
 import * as api from "@/lib/api";
 import type { AdjacentSubnet, SubnetEvidence } from "@/lib/types";
 
@@ -103,8 +103,11 @@ export function AdjacentNetworks({
                     className="flex items-start gap-2 text-xs"
                     style={{ color: "var(--text-secondary)" }}
                   >
-                    <span aria-hidden style={{ color: "var(--text-muted)" }}>
-                      {evidenceIcon(item)}
+                    <span
+                      aria-hidden
+                      style={{ color: "var(--text-muted)", display: "inline-flex" }}
+                    >
+                      <Icon name={evidenceIcon(item)} size={13} className="mt-0.5" />
                     </span>
                     <span className="min-w-0">{explain(item)}</span>
                   </li>
@@ -162,16 +165,16 @@ export function AdjacentNetworks({
   );
 }
 
-function evidenceIcon(evidence: SubnetEvidence): string {
+function evidenceIcon(evidence: SubnetEvidence): IconName {
   switch (evidence.kind) {
     case "route":
-      return "⇥";
+      return "route";
     case "controller":
-      return "⊞";
+      return "controller";
     case "responder":
-      return "◉";
+      return "wifi";
     case "traceHop":
-      return "↭";
+      return "hops";
   }
 }
 

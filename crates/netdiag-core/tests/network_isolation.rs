@@ -283,3 +283,140 @@ async fn a_fresh_install_has_nothing_to_migrate() {
         .is_none());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[tokio::test]
+async fn locations_survive_a_save_and_load_round_trip() {
+    let root = temp_root("locations-round-trip");
+
+    let mut index = NetworkIndex::default();
+    index
+        .networks
+        .push(NetworkProfile::new("LAN", site("aa:aa:aa:aa:aa:aa", "Office")));
+    index
+        .networks
+        .push(NetworkProfile::new("Guest", site("aa:aa:aa:aa:aa:ab", "Office guest")));
+    index
+        .networks
+        .push(NetworkProfile::new("Home", site("bb:bb:bb:bb:bb:bb", "HomeWiFi")));
+
+    let office = index.add_location("Head office").unwrap();
+    index.add_location("Attic").unwrap();
+    let (lan, guest) = (index.networks[0].id.clone(), index.networks[1].id.clone());
+    index.assign_location(&lan, Some(&office)).unwrap();
+    index.assign_location(&guest, Some(&office)).unwrap();
+    index.save(&root).await.unwrap();
+
+    let loaded = NetworkIndex::load(&root).await;
+    assert_eq!(loaded.locations.len(), 2);
+    assert_eq!(loaded.get(&lan).unwrap().location_id.as_deref(), Some(office.as_str()));
+    assert_eq!(loaded.get(&guest).unwrap().location_id.as_deref(), Some(office.as_str()));
+    assert!(loaded.networks[2].location_id.is_none());
+
+    // The one ordering rule, applied to what actually came off disk.
+    let names: Vec<&str> = loaded
+        .locations_sorted()
+        .iter()
+        .map(|location| location.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["Attic", "Head office"]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn a_location_id_pointing_at_a_deleted_location_self_heals_on_load() {
+    let root = temp_root("locations-heal");
+
+    let mut index = NetworkIndex::default();
+    index
+        .networks
+        .push(NetworkProfile::new("LAN", site("aa:aa:aa:aa:aa:aa", "Office")));
+    let office = index.add_location("Head office").unwrap();
+    let lan = index.networks[0].id.clone();
+    index.assign_location(&lan, Some(&office)).unwrap();
+    index.save(&root).await.unwrap();
+
+    // Drop the location behind the index's back — a half-completed write, or a
+    // file edited by hand.
+    index.locations.clear();
+    index.save(&root).await.unwrap();
+
+    let loaded = NetworkIndex::load(&root).await;
+    assert_eq!(
+        loaded.networks.len(),
+        1,
+        "a dangling location must not make a network disappear"
+    );
+    assert!(loaded.networks[0].location_id.is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn deleting_a_location_never_deletes_a_networks_history() {
+    let root = temp_root("locations-delete");
+
+    let mut index = NetworkIndex::default();
+    index
+        .networks
+        .push(NetworkProfile::new("LAN", site("aa:aa:aa:aa:aa:aa", "Office")));
+    index
+        .networks
+        .push(NetworkProfile::new("Guest", site("aa:aa:aa:aa:aa:ab", "Office guest")));
+    let office = index.add_location("Head office").unwrap();
+    let (lan, guest) = (index.networks[0].id.clone(), index.networks[1].id.clone());
+    index.assign_location(&lan, Some(&office)).unwrap();
+    index.assign_location(&guest, Some(&office)).unwrap();
+    index.save(&root).await.unwrap();
+
+    let lan_store = Store::new(NetworkIndex::scans_dir(&root, &lan));
+    lan_store
+        .save(&snapshot("2026-08-04T10-00-00-000Z", &["192.168.0.10"]))
+        .await
+        .unwrap();
+    let guest_store = Store::new(NetworkIndex::scans_dir(&root, &guest));
+    guest_store
+        .save(&snapshot("2026-08-04T11-00-00-000Z", &["192.168.1.10"]))
+        .await
+        .unwrap();
+
+    assert_eq!(index.delete_location(&office).unwrap(), 2);
+    index.save(&root).await.unwrap();
+
+    let loaded = NetworkIndex::load(&root).await;
+    assert_eq!(loaded.networks.len(), 2, "a grouping label owns nothing");
+    assert!(loaded.locations.is_empty());
+    assert_eq!(lan_store.list_ids().await.len(), 1);
+    assert_eq!(guest_store.list_ids().await.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn an_index_written_before_locations_existed_loads_from_disk() {
+    let root = temp_root("locations-upgrade");
+
+    // The real upgrade risk is at the file level, so write the old shape.
+    let legacy = r#"{
+        "active": "net-20240101-000000-00000-0000",
+        "networks": [
+            {
+                "id": "net-20240101-000000-00000-0000",
+                "name": "Home",
+                "fingerprint": { "subnets": ["192.168.0.0/24"], "dnsServers": [] },
+                "createdAt": "2024-01-01T00:00:00Z",
+                "scanCount": 3
+            }
+        ]
+    }"#;
+    std::fs::write(NetworkIndex::index_path(&root), legacy).unwrap();
+
+    let loaded = NetworkIndex::load(&root).await;
+    assert_eq!(loaded.networks.len(), 1);
+    assert_eq!(loaded.networks[0].name, "Home");
+    assert_eq!(loaded.networks[0].scan_count, 3);
+    assert!(loaded.locations.is_empty());
+    assert!(loaded.networks[0].location_id.is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+}

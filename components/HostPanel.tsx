@@ -1,6 +1,6 @@
 "use client";
 
-import { Card, KeyValue, StatusBadge } from "./ui";
+import { Card, Icon, KeyValue, StatusBadge, StatusMark } from "./ui";
 import type { ScanSnapshot } from "@/lib/types";
 
 export function HostPanel({ snapshot }: { snapshot: ScanSnapshot }) {
@@ -138,9 +138,10 @@ export function HostPanel({ snapshot }: { snapshot: ScanSnapshot }) {
                             : capability.status === "degraded"
                               ? "var(--status-warning)"
                               : "var(--status-critical)",
+                        display: "inline-flex",
                       }}
                     >
-                      ●
+                      <Icon name="dot" size={10} />
                     </span>
                     {capability.label}
                   </span>
@@ -156,9 +157,7 @@ export function HostPanel({ snapshot }: { snapshot: ScanSnapshot }) {
           <ul className="space-y-1.5">
             {snapshot.warnings.map((warning, i) => (
               <li key={i} className="flex items-start gap-2 text-sm">
-                <span aria-hidden style={{ color: "var(--status-warning)" }}>
-                  ▲
-                </span>
+                <StatusMark tone="warning" className="mt-1" />
                 <span style={{ color: "var(--text-secondary)" }}>{warning}</span>
               </li>
             ))}

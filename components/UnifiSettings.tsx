@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Button, Card, LoadingState, Spinner, StatusBadge } from "./ui";
+import { Button, Card, Icon, LoadingState, Spinner, StatusBadge } from "./ui";
 import * as api from "@/lib/api";
 import type { UnifiConfig } from "@/lib/types";
 
@@ -19,6 +19,7 @@ export function UnifiSettings({ onChanged }: { onChanged?: () => void }) {
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [coverage, setCoverage] = useState<api.DiagnosticCoverage[] | null>(null);
 
   useEffect(() => {
     if (!api.isDesktop()) return;
@@ -56,6 +57,22 @@ export function UnifiSettings({ onChanged }: { onChanged?: () => void }) {
       if (stored) setConfig(stored);
       setPassword("");
       onChanged?.();
+    } catch (error) {
+      setResult({ ok: false, message: String(error) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /* Which of the fields the diagnostics rely on this controller actually
+   * sends. A detector can be correct and still never fire because the release
+   * omits its field, and that is indistinguishable from "nothing is wrong"
+   * unless it is stated. */
+  const checkFields = async () => {
+    setBusy(true);
+    setResult(null);
+    try {
+      setCoverage(await api.checkControllerFields());
     } catch (error) {
       setResult({ ok: false, message: String(error) });
     } finally {
@@ -227,13 +244,69 @@ export function UnifiSettings({ onChanged }: { onChanged?: () => void }) {
               Save
             </Button>
             {config.host && (
+              <Button onClick={checkFields} disabled={busy}>
+                Check diagnostic fields
+              </Button>
+            )}
+            {config.host && (
               <Button variant="danger" onClick={disconnect} disabled={busy}>
                 Disconnect
               </Button>
             )}
           </div>
+
+          {coverage && <FieldCoverageReport coverage={coverage} />}
         </div>
       )}
     </Card>
+  );
+}
+
+/**
+ * Which diagnostics this controller can support.
+ *
+ * A finding whose evidence this release does not report is *unavailable*, which
+ * is a different answer from "nothing wrong" — and without saying so, an empty
+ * result is indistinguishable from a clean one. Named by finding rather than by
+ * JSON field, because that is what the absence actually costs the user.
+ */
+function FieldCoverageReport({ coverage }: { coverage: api.DiagnosticCoverage[] }) {
+  const unavailable = coverage.filter((entry) => !entry.available);
+
+  return (
+    <div className="rounded-lg border p-3" style={{ borderColor: "var(--border)" }}>
+      <p className="text-xs font-medium">
+        {unavailable.length === 0
+          ? "This controller supports every diagnostic."
+          : `${unavailable.length} of ${coverage.length} diagnostics cannot run against this controller.`}
+      </p>
+      <ul className="mt-2 space-y-1">
+        {coverage.map((entry) => (
+          <li key={entry.finding} className="flex flex-wrap items-center gap-2 text-[11px]">
+            <span
+              aria-hidden
+              style={{
+                color: entry.available ? "var(--status-good)" : "var(--text-muted)",
+                display: "inline-flex",
+              }}
+            >
+              <Icon name={entry.available ? "dot" : "dotOutline"} size={9} />
+            </span>
+            <span style={{ color: "var(--text-secondary)" }}>{entry.finding}</span>
+            {!entry.available && (
+              <span className="font-mono" style={{ color: "var(--text-muted)" }}>
+                needs {entry.missing.join(", ")}
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+      {unavailable.length > 0 && (
+        <p className="mt-2 text-[11px]" style={{ color: "var(--text-secondary)" }}>
+          Those findings will stay silent here. That is a limit of this controller release, not a
+          clean bill of health.
+        </p>
+      )}
+    </div>
   );
 }

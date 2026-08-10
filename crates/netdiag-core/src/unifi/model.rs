@@ -18,6 +18,84 @@ where
         .filter(|value| !value.is_empty()))
 }
 
+/* ------------------------------------------------------------ loose numbers */
+
+/// The controller is not consistent about JSON types.
+///
+/// The same field arrives as `14200` from one release and `"14200"` from
+/// another, and differs between device models within a single release — which
+/// is why every mature UniFi client carries an equivalent of this (`unpoller`
+/// calls them `FlexInt`/`FlexBool`). Typing such a field as `i64` is not merely
+/// strict, it is destructive: `parse_list` drops any record that fails to
+/// deserialize, so one string-typed counter removes an entire switch from the
+/// results rather than one column.
+///
+/// These never fail. A value that cannot be read becomes `None`, in keeping
+/// with the crate's degrade-never-fail rule — and `None` means "not reported",
+/// which the diagnostics are careful to distinguish from zero.
+fn flex_f64(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        serde_json::Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+}
+
+fn de_flex_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.as_ref().and_then(flex_f64))
+}
+
+fn de_flex_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.as_ref().and_then(flex_f64).map(|n| n as i64))
+}
+
+fn de_flex_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw
+        .as_ref()
+        .and_then(flex_f64)
+        .filter(|n| *n >= 0.0)
+        .map(|n| n as u32))
+}
+
+fn de_flex_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.as_ref().and_then(flex_f64).map(|n| n as i32))
+}
+
+/// Accepts `true`, `"true"`, `1`, `"1"`, `"yes"` and their negatives.
+fn de_flex_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.as_ref().and_then(|value| match value {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::Number(n) => n.as_f64().map(|n| n != 0.0),
+        serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "1" | "on" => Some(true),
+            "false" | "no" | "0" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }))
+}
+
 /// One entry from `stat/sta` (active) or `stat/alluser` (all known).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -41,12 +119,17 @@ pub struct UnifiClientRecord {
     #[serde(deserialize_with = "de_mac")]
     pub ap_mac: Option<String>,
     pub essid: Option<String>,
+    #[serde(deserialize_with = "de_flex_u32")]
     pub channel: Option<u32>,
     pub radio: Option<String>,
     pub radio_proto: Option<String>,
+    #[serde(deserialize_with = "de_flex_i32")]
     pub rssi: Option<i32>,
+    #[serde(deserialize_with = "de_flex_i32")]
     pub signal: Option<i32>,
+    #[serde(deserialize_with = "de_flex_i32")]
     pub noise: Option<i32>,
+    #[serde(deserialize_with = "de_flex_i32")]
     pub satisfaction: Option<i32>,
 
     /// Switch and port a wired client is on — the physical-location payload.
@@ -59,6 +142,23 @@ pub struct UnifiClientRecord {
     pub last_seen: Option<i64>,
     pub tx_bytes: Option<i64>,
     pub rx_bytes: Option<i64>,
+
+    /// Negotiated PHY rates in kbps, and how often frames had to be sent again.
+    ///
+    /// A strong signal is not the same as a fast link: a client that settled on
+    /// 6 Mbps, or one retrying a third of its frames, transfers slowly and holds
+    /// the channel while doing it — which is what makes *everyone else* slow.
+    #[serde(deserialize_with = "de_flex_i64")]
+    pub tx_rate: Option<i64>,
+    #[serde(deserialize_with = "de_flex_i64")]
+    pub rx_rate: Option<i64>,
+    /// `wifi_tx_retries` on some releases.
+    #[serde(alias = "wifi_tx_retries", deserialize_with = "de_flex_i64")]
+    pub tx_retries: Option<i64>,
+    #[serde(deserialize_with = "de_flex_i64")]
+    pub tx_packets: Option<i64>,
+    #[serde(deserialize_with = "de_flex_u32")]
+    pub channel_width: Option<u32>,
 
     /// The controller's own fingerprint of the device.
     pub dev_vendor: Option<serde_json::Value>,
@@ -132,18 +232,79 @@ impl UnifiClientRecord {
         };
         Some(label.to_string())
     }
+
+    /// Slower of the two negotiated PHY rates, in Mbps.
+    ///
+    /// The slower direction is the one that bounds a transfer, and it is the
+    /// number that explains a slow upload when the signal looks fine.
+    pub fn slowest_rate_mbps(&self) -> Option<i64> {
+        let rates: Vec<i64> = [self.tx_rate, self.rx_rate]
+            .into_iter()
+            .flatten()
+            .filter(|rate| *rate > 0)
+            .collect();
+        rates.into_iter().min().map(|kbps| kbps / 1000)
+    }
+
+    /// Share of transmitted frames that had to be sent again, as a percentage.
+    ///
+    /// Retries are airtime spent achieving nothing. Above roughly a fifth, a
+    /// client is degrading the cell for everyone on it, not only itself.
+    pub fn retry_percent(&self) -> Option<f64> {
+        let packets = self.tx_packets?;
+        let retries = self.tx_retries?;
+        if packets <= 0 {
+            return None;
+        }
+        Some((retries as f64 / packets as f64) * 100.0)
+    }
 }
 
 /// A port on a UniFi switch.
+///
+/// The counters matter as much as the link speed. "Gigabit link, terrible
+/// throughput" is most often half duplex or a damaged pair, and neither is
+/// visible from `speed` alone — the first shows in `full_duplex`, the second in
+/// an error counter climbing while traffic flows.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct PortEntry {
+    #[serde(deserialize_with = "de_flex_u32")]
     pub port_idx: Option<u32>,
     pub name: Option<String>,
+    #[serde(deserialize_with = "de_flex_bool")]
     pub up: Option<bool>,
+    #[serde(deserialize_with = "de_flex_i64")]
     pub speed: Option<i64>,
+    /// Half duplex on a modern switch means autonegotiation failed. Throughput
+    /// collapses under bidirectional load while a ping still looks fine.
+    #[serde(deserialize_with = "de_flex_bool")]
+    pub full_duplex: Option<bool>,
+    #[serde(deserialize_with = "de_flex_bool")]
     pub poe_enable: Option<bool>,
     pub poe_power: Option<serde_json::Value>,
+    /// Lifetime counters. A single reading says little — two readings either
+    /// side of a reproduction say everything.
+    ///
+    /// `rx_error`/`tx_error` are accepted as aliases: the singular spelling
+    /// appears on some switch models and older releases.
+    #[serde(alias = "rx_error", deserialize_with = "de_flex_i64")]
+    pub rx_errors: Option<i64>,
+    #[serde(alias = "tx_error", deserialize_with = "de_flex_i64")]
+    pub tx_errors: Option<i64>,
+    #[serde(alias = "rx_drop", deserialize_with = "de_flex_i64")]
+    pub rx_dropped: Option<i64>,
+    #[serde(alias = "tx_drop", deserialize_with = "de_flex_i64")]
+    pub tx_dropped: Option<i64>,
+    #[serde(deserialize_with = "de_flex_i64")]
+    pub rx_bytes: Option<i64>,
+    #[serde(deserialize_with = "de_flex_i64")]
+    pub tx_bytes: Option<i64>,
+    /// `forwarding`, `blocking`, `disabled`… A port stuck blocking is a loop
+    /// that spanning tree already caught.
+    pub stp_state: Option<String>,
+    #[serde(deserialize_with = "de_flex_bool")]
+    pub is_uplink: Option<bool>,
     /// MACs the switch has learned on this port. More than one means something
     /// unmanaged is plugged in behind it.
     pub mac_table: Option<Vec<MacTableEntry>>,
@@ -158,6 +319,30 @@ impl PortEntry {
             serde_json::Value::String(s) => s.trim().parse().ok(),
             _ => None,
         }
+    }
+
+    /// Total frames the port logged as bad, in either direction.
+    ///
+    /// `None` when the controller reported neither counter, which is different
+    /// from a port that reported zero — the first means "cannot tell", and a
+    /// diagnosis must not treat it as "healthy".
+    pub fn error_total(&self) -> Option<i64> {
+        match (self.rx_errors, self.tx_errors) {
+            (None, None) => None,
+            (rx, tx) => Some(rx.unwrap_or(0) + tx.unwrap_or(0)),
+        }
+    }
+
+    pub fn drop_total(&self) -> Option<i64> {
+        match (self.rx_dropped, self.tx_dropped) {
+            (None, None) => None,
+            (rx, tx) => Some(rx.unwrap_or(0) + tx.unwrap_or(0)),
+        }
+    }
+
+    /// A link that came up half duplex. Only meaningful while the port is up.
+    pub fn is_half_duplex(&self) -> bool {
+        self.up.unwrap_or(false) && self.full_duplex == Some(false)
     }
 }
 
@@ -186,6 +371,117 @@ pub struct UnifiDeviceRecord {
     pub uptime: Option<i64>,
     pub upgradable: Option<bool>,
     pub port_table: Option<Vec<PortEntry>>,
+    /// CPU and memory load. A gateway pinned at 100% is the difference between
+    /// "one link is slow" and "the whole network stalls" — the symptom users
+    /// describe as freezing.
+    #[serde(rename = "system-stats")]
+    pub system_stats: Option<SystemStats>,
+    /// Per-radio airtime. A band at 90% utilisation is saturated regardless of
+    /// how strong any individual client's signal looks.
+    pub radio_table_stats: Option<Vec<RadioStats>>,
+    /// Present on a meshed access point: its wireless backhaul. Everything
+    /// behind it shares that one link.
+    pub uplink: Option<Uplink>,
+}
+
+/// Load on a managed device, from `system-stats`.
+///
+/// The controller sends these as numeric strings in most releases and as
+/// numbers in some; both are accepted, in keeping with how `poe_power` is
+/// handled a few types above.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct SystemStats {
+    #[serde(deserialize_with = "de_flex_f64")]
+    pub cpu: Option<f64>,
+    #[serde(deserialize_with = "de_flex_f64")]
+    pub mem: Option<f64>,
+}
+
+impl SystemStats {
+    pub fn cpu_percent(&self) -> Option<f64> {
+        self.cpu
+    }
+
+    pub fn mem_percent(&self) -> Option<f64> {
+        self.mem
+    }
+}
+
+/// One radio's airtime, from `radio_table_stats`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RadioStats {
+    pub name: Option<String>,
+    pub radio: Option<String>,
+    #[serde(deserialize_with = "de_flex_u32")]
+    pub channel: Option<u32>,
+    /// Total channel utilisation as a percentage, including other people's
+    /// networks — which is why a quiet AP can still sit on a busy channel.
+    #[serde(deserialize_with = "de_flex_f64")]
+    pub cu_total: Option<f64>,
+    /// The share this radio itself is responsible for, split by direction.
+    #[serde(deserialize_with = "de_flex_f64")]
+    pub cu_self_rx: Option<f64>,
+    #[serde(deserialize_with = "de_flex_f64")]
+    pub cu_self_tx: Option<f64>,
+    #[serde(deserialize_with = "de_flex_i64")]
+    pub num_sta: Option<i64>,
+    #[serde(deserialize_with = "de_flex_i64")]
+    pub satisfaction: Option<i64>,
+}
+
+impl RadioStats {
+    pub fn utilisation_percent(&self) -> Option<f64> {
+        self.cu_total
+    }
+
+    /// Airtime this radio is not responsible for — neighbours, or a legacy
+    /// client dragging the whole cell down.
+    ///
+    /// Requires both self-utilisation figures: without them the split cannot be
+    /// computed, and reporting the total as though it were all interference
+    /// would point the remedy at the wrong network.
+    pub fn interference_percent(&self) -> Option<f64> {
+        let total = self.utilisation_percent()?;
+        let own = self.cu_self_rx? + self.cu_self_tx?;
+        Some((total - own).max(0.0))
+    }
+
+    pub fn band(&self) -> &'static str {
+        match self.radio.as_deref() {
+            Some("ng") => "2.4 GHz",
+            Some("na") => "5 GHz",
+            Some("6e") | Some("ax") => "6 GHz",
+            _ => "unknown band",
+        }
+    }
+}
+
+/// A meshed access point's wireless backhaul.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Uplink {
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    #[serde(deserialize_with = "de_mac")]
+    pub uplink_mac: Option<String>,
+    #[serde(deserialize_with = "de_flex_u32")]
+    pub uplink_remote_port: Option<u32>,
+    #[serde(deserialize_with = "de_flex_i32")]
+    pub rssi: Option<i32>,
+    #[serde(deserialize_with = "de_flex_i64")]
+    pub speed: Option<i64>,
+    #[serde(deserialize_with = "de_flex_i64")]
+    pub max_speed: Option<i64>,
+}
+
+impl Uplink {
+    /// Wireless backhaul, as opposed to a wired uplink. Everything associated
+    /// with the AP shares this link, so its quality caps theirs.
+    pub fn is_wireless(&self) -> bool {
+        matches!(self.kind.as_deref(), Some("wireless"))
+    }
 }
 
 impl UnifiDeviceRecord {
@@ -802,6 +1098,163 @@ impl UnifiSnapshot {
 
         out
     }
+
+    /// Live ports that negotiated half duplex, or that are carrying errors.
+    ///
+    /// Both are invisible in the link speed and both destroy throughput while
+    /// leaving a ping healthy — which is exactly the shape of "the link says
+    /// gigabit but the transfer crawls". Reported separately from
+    /// [`Self::degraded_link_ports`] because the remedy differs: half duplex is
+    /// a negotiation problem, errors are usually a physical one.
+    pub fn troubled_ports(&self) -> Vec<TroubledPort> {
+        let mut out = Vec::new();
+
+        for device in &self.raw_devices {
+            let Some(ports) = &device.port_table else {
+                continue;
+            };
+            for port in ports.iter().filter(|port| port.up == Some(true)) {
+                let half_duplex = port.is_half_duplex();
+                let errors = port.error_total().unwrap_or(0);
+                let drops = port.drop_total().unwrap_or(0);
+                let blocked = port
+                    .stp_state
+                    .as_deref()
+                    .is_some_and(|state| state.eq_ignore_ascii_case("blocking"));
+
+                if !half_duplex && errors == 0 && drops == 0 && !blocked {
+                    continue;
+                }
+
+                out.push(TroubledPort {
+                    switch_name: device.describe(),
+                    port: port.port_idx.unwrap_or(0),
+                    port_name: port.name.clone().filter(|n| !n.trim().is_empty()),
+                    speed_mbps: port.speed.unwrap_or(0),
+                    half_duplex,
+                    errors,
+                    drops,
+                    stp_blocking: blocked,
+                });
+            }
+        }
+
+        out
+    }
+
+    /// Radios whose airtime is close to spent.
+    ///
+    /// A saturated channel slows every client on it no matter how strong each
+    /// one's signal is, which is why per-client RSSI alone never explains a
+    /// whole-network stall.
+    pub fn saturated_radios(&self, threshold_percent: f64) -> Vec<SaturatedRadio> {
+        let mut out = Vec::new();
+
+        for device in &self.raw_devices {
+            let Some(radios) = &device.radio_table_stats else {
+                continue;
+            };
+            for radio in radios {
+                let Some(utilisation) = radio.utilisation_percent() else {
+                    continue;
+                };
+                if utilisation < threshold_percent {
+                    continue;
+                }
+                out.push(SaturatedRadio {
+                    access_point: device.describe(),
+                    band: radio.band().to_string(),
+                    utilisation_percent: utilisation,
+                    interference_percent: radio.interference_percent(),
+                    clients: radio.num_sta.unwrap_or(0),
+                });
+            }
+        }
+
+        out
+    }
+
+    /// Managed devices under sustained load.
+    ///
+    /// A gateway at its limit stalls traffic it is routing between VLANs, which
+    /// presents to a user as the whole network freezing rather than as one slow
+    /// link.
+    pub fn loaded_devices(&self, cpu_threshold: f64) -> Vec<LoadedDevice> {
+        self.raw_devices
+            .iter()
+            .filter_map(|device| {
+                let stats = device.system_stats.as_ref()?;
+                let cpu = stats.cpu_percent()?;
+                (cpu >= cpu_threshold).then(|| LoadedDevice {
+                    device: device.describe(),
+                    role: device.kind_label().to_string(),
+                    cpu_percent: cpu,
+                    mem_percent: stats.mem_percent(),
+                })
+            })
+            .collect()
+    }
+
+    /// Access points reaching the network over a wireless backhaul.
+    ///
+    /// Everything associated with a meshed AP shares that one link, so its
+    /// quality caps theirs — a fact no per-client measurement reveals.
+    pub fn meshed_access_points(&self) -> Vec<MeshedAccessPoint> {
+        self.raw_devices
+            .iter()
+            .filter_map(|device| {
+                let uplink = device.uplink.as_ref()?;
+                uplink.is_wireless().then(|| MeshedAccessPoint {
+                    access_point: device.describe(),
+                    rssi: uplink.rssi,
+                    speed_mbps: uplink.speed,
+                    max_speed_mbps: uplink.max_speed,
+                })
+            })
+            .collect()
+    }
+}
+
+/// A live port that is half duplex, dropping frames, or blocked by STP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TroubledPort {
+    pub switch_name: String,
+    pub port: u32,
+    pub port_name: Option<String>,
+    pub speed_mbps: i64,
+    pub half_duplex: bool,
+    pub errors: i64,
+    pub drops: i64,
+    pub stp_blocking: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaturatedRadio {
+    pub access_point: String,
+    pub band: String,
+    pub utilisation_percent: f64,
+    pub interference_percent: Option<f64>,
+    pub clients: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadedDevice {
+    pub device: String,
+    pub role: String,
+    pub cpu_percent: f64,
+    pub mem_percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshedAccessPoint {
+    pub access_point: String,
+    pub rssi: Option<i32>,
+    pub speed_mbps: Option<i64>,
+    pub max_speed_mbps: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -826,6 +1279,208 @@ pub struct DegradedLinkPort {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot_with(devices: Vec<UnifiDeviceRecord>) -> UnifiSnapshot {
+        UnifiSnapshot {
+            raw_devices: devices,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn numbers_arriving_as_strings_parse_the_same_as_numbers() {
+        // The controller is not consistent about JSON types across releases or
+        // device models, so both shapes must produce the same result.
+        let numeric = r#"{"port_idx":7,"up":true,"speed":1000,"full_duplex":false,
+                          "rx_errors":14200,"tx_errors":3}"#;
+        let stringly = r#"{"port_idx":"7","up":"true","speed":"1000","full_duplex":"false",
+                           "rx_errors":"14200","tx_errors":"3"}"#;
+
+        let a: PortEntry = serde_json::from_str(numeric).unwrap();
+        let b: PortEntry = serde_json::from_str(stringly).unwrap();
+
+        for port in [&a, &b] {
+            assert_eq!(port.port_idx, Some(7));
+            assert_eq!(port.speed, Some(1000));
+            assert_eq!(port.up, Some(true));
+            assert_eq!(port.full_duplex, Some(false));
+            assert_eq!(port.error_total(), Some(14_203));
+            assert!(port.is_half_duplex());
+        }
+    }
+
+    #[test]
+    fn a_string_typed_counter_does_not_delete_the_whole_switch() {
+        // `parse_list` drops records that fail to deserialize, so a strict type
+        // here costs an entire device rather than one column — the switch would
+        // simply be absent from the results, with nothing to say why.
+        let record: UnifiDeviceRecord = serde_json::from_str(
+            r#"{"name":"USW-24","type":"usw","port_table":[
+                {"port_idx":"1","up":"1","speed":"1000","rx_errors":"0"}
+            ]}"#,
+        )
+        .expect("a controller sending strings must not cost us the device");
+
+        assert_eq!(record.describe(), "USW-24");
+        assert_eq!(record.port_table.as_ref().unwrap()[0].speed, Some(1000));
+    }
+
+    #[test]
+    fn a_value_that_cannot_be_read_becomes_unknown_rather_than_an_error() {
+        // Degrade, never fail: an unparseable field costs that field only.
+        let port: PortEntry =
+            serde_json::from_str(r#"{"port_idx":1,"up":true,"speed":"n/a","rx_errors":null}"#)
+                .unwrap();
+        assert_eq!(port.speed, None);
+        assert_eq!(port.error_total(), None, "null is not zero");
+    }
+
+    #[test]
+    fn renamed_counter_fields_are_accepted_under_their_older_spellings() {
+        let port: PortEntry =
+            serde_json::from_str(r#"{"port_idx":3,"up":true,"rx_error":42,"tx_drop":7}"#).unwrap();
+        assert_eq!(port.error_total(), Some(42));
+        assert_eq!(port.drop_total(), Some(7));
+    }
+
+    #[test]
+    fn interference_is_unknown_rather_than_guessed_when_the_split_is_missing() {
+        // Without the self-utilisation figures the split cannot be computed;
+        // reporting the total as interference would blame the neighbours for
+        // this network's own traffic.
+        let radio: RadioStats = serde_json::from_str(r#"{"radio":"ng","cu_total":"92"}"#).unwrap();
+        assert_eq!(radio.utilisation_percent(), Some(92.0));
+        assert_eq!(radio.interference_percent(), None);
+    }
+
+    #[test]
+    fn a_half_duplex_link_is_found_even_at_full_speed() {
+        // The case a speed check cannot see: the link says gigabit, and every
+        // bidirectional transfer over it collapses.
+        let device: UnifiDeviceRecord = serde_json::from_str(
+            r#"{"name":"USW-MINI","model":"USMINI","type":"usw","port_table":[
+                {"port_idx":1,"up":true,"speed":1000,"full_duplex":true},
+                {"port_idx":7,"up":true,"speed":1000,"full_duplex":false}
+            ]}"#,
+        )
+        .unwrap();
+
+        let troubled = snapshot_with(vec![device]).troubled_ports();
+        assert_eq!(troubled.len(), 1);
+        assert_eq!(troubled[0].port, 7);
+        assert!(troubled[0].half_duplex);
+        assert_eq!(
+            troubled[0].speed_mbps, 1000,
+            "the speed is fine — that is the point"
+        );
+    }
+
+    #[test]
+    fn a_port_carrying_errors_is_found_and_a_clean_one_is_not() {
+        let device: UnifiDeviceRecord = serde_json::from_str(
+            r#"{"name":"USW-24","type":"usw","port_table":[
+                {"port_idx":1,"up":true,"speed":1000,"full_duplex":true,
+                 "rx_errors":0,"tx_errors":0},
+                {"port_idx":4,"up":true,"speed":1000,"full_duplex":true,
+                 "rx_errors":14200,"tx_errors":3,"rx_dropped":12},
+                {"port_idx":9,"up":false,"speed":0,"rx_errors":999}
+            ]}"#,
+        )
+        .unwrap();
+
+        let troubled = snapshot_with(vec![device]).troubled_ports();
+        assert_eq!(
+            troubled.iter().map(|p| p.port).collect::<Vec<_>>(),
+            vec![4],
+            "a down port's stale counters are not a live finding"
+        );
+        assert_eq!(troubled[0].errors, 14_203);
+        assert_eq!(troubled[0].drops, 12);
+    }
+
+    #[test]
+    fn a_port_reporting_no_counters_is_not_reported_as_healthy() {
+        // "Cannot tell" must never be recorded as zero — a diagnosis built on
+        // that would rule out the very thing it failed to measure.
+        let port: PortEntry = serde_json::from_str(r#"{"port_idx":1,"up":true}"#).unwrap();
+        assert_eq!(port.error_total(), None);
+        assert_eq!(port.drop_total(), None);
+    }
+
+    #[test]
+    fn radio_airtime_separates_our_own_traffic_from_everyone_elses() {
+        let device: UnifiDeviceRecord = serde_json::from_str(
+            r#"{"name":"AP-Office","type":"uap","radio_table_stats":[
+                {"radio":"ng","cu_total":"92","cu_self_rx":"10","cu_self_tx":"12","num_sta":9},
+                {"radio":"na","cu_total":31,"cu_self_rx":8,"cu_self_tx":9,"num_sta":4}
+            ]}"#,
+        )
+        .unwrap();
+
+        let saturated = snapshot_with(vec![device]).saturated_radios(80.0);
+        assert_eq!(saturated.len(), 1, "only the busy band");
+        assert_eq!(saturated[0].band, "2.4 GHz");
+        assert_eq!(saturated[0].utilisation_percent, 92.0);
+        assert_eq!(
+            saturated[0].interference_percent,
+            Some(70.0),
+            "92 total less 22 of our own is somebody else's"
+        );
+    }
+
+    #[test]
+    fn a_loaded_gateway_is_reported_from_numbers_or_strings() {
+        // The controller sends these as strings in some releases.
+        let device: UnifiDeviceRecord = serde_json::from_str(
+            r#"{"name":"UDM-Pro","type":"udm","system-stats":{"cpu":"97.5","mem":68}}"#,
+        )
+        .unwrap();
+
+        let loaded = snapshot_with(vec![device]).loaded_devices(85.0);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].cpu_percent, 97.5);
+        assert_eq!(loaded[0].mem_percent, Some(68.0));
+        assert_eq!(loaded[0].role, "Gateway");
+    }
+
+    #[test]
+    fn a_wired_uplink_is_not_a_mesh() {
+        let wired: UnifiDeviceRecord =
+            serde_json::from_str(r#"{"name":"AP-Hall","uplink":{"type":"wire"}}"#).unwrap();
+        let mesh: UnifiDeviceRecord = serde_json::from_str(
+            r#"{"name":"AP-Shed","uplink":{"type":"wireless","rssi":31,"speed":130}}"#,
+        )
+        .unwrap();
+
+        let found = snapshot_with(vec![wired, mesh]).meshed_access_points();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].access_point, "AP-Shed");
+        assert_eq!(found[0].speed_mbps, Some(130));
+    }
+
+    #[test]
+    fn client_rates_and_retries_explain_a_slow_transfer() {
+        let record: UnifiClientRecord = serde_json::from_str(
+            r#"{"mac":"aa:bb:cc:dd:ee:ff","rssi":48,
+                "tx_rate":6000,"rx_rate":72000,"tx_packets":10000,"tx_retries":3200}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            record.slowest_rate_mbps(),
+            Some(6),
+            "the slow direction bounds the transfer, whatever the signal says"
+        );
+        assert_eq!(record.retry_percent(), Some(32.0));
+    }
+
+    #[test]
+    fn a_client_without_rate_counters_reports_nothing_rather_than_zero() {
+        let record: UnifiClientRecord =
+            serde_json::from_str(r#"{"mac":"aa:bb:cc:dd:ee:ff","rssi":48}"#).unwrap();
+        assert_eq!(record.slowest_rate_mbps(), None);
+        assert_eq!(record.retry_percent(), None);
+    }
 
     #[test]
     fn parses_a_client_record_and_normalizes_the_mac() {

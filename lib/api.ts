@@ -10,10 +10,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AdjacentSubnet,
+  AssistConfig,
+  AssistEvent,
+  AssistSettings,
   AutoRepeatState,
+  CaseSummary,
   DiscoveredNetwork,
   DoctorReport,
   Detection,
+  Location,
   NetworkList,
   NetworkProfile,
   UnifiConfig,
@@ -27,6 +32,7 @@ import type {
   ScanStatus,
   ScanTarget,
   SnapshotSummary,
+  TroubleshootingCase,
 } from "./types";
 
 /** Next's dev server renders once on the server during export; guard against that. */
@@ -148,11 +154,111 @@ export async function clearUnifiConfig(): Promise<void> {
   return invoke("clear_unifi_config");
 }
 
+/** Whether one diagnostic can run against this controller, and what is missing. */
+export interface DiagnosticCoverage {
+  finding: string;
+  endpoint: string;
+  available: boolean;
+  missing: string[];
+}
+
+/**
+ * Asks the controller which diagnostics it can actually support.
+ *
+ * UniFi releases differ in what they report, so a detector can be correct and
+ * still never fire — which makes an empty result ambiguous until this is
+ * answered. `saveTo` writes the raw payloads to that path; opt-in, because they
+ * contain MACs, hostnames and SSIDs.
+ */
+export async function checkControllerFields(saveTo?: string): Promise<DiagnosticCoverage[]> {
+  return invoke<DiagnosticCoverage[]>("check_controller_fields", {
+    saveTo: saveTo ?? null,
+  });
+}
+
 export async function testUnifiConnection(
   config: UnifiConfig,
   password?: string,
 ): Promise<string> {
   return invoke<string>("test_unifi_connection", { config, password: password ?? null });
+}
+
+/* ----------------------------------------------------------------- assistant */
+
+export async function getAssistConfig(): Promise<AssistSettings> {
+  return invoke<AssistSettings>("get_assist_config");
+}
+
+/**
+ * Saves settings, and the API key when one is supplied.
+ *
+ * The key is optional so the model or endpoint can be changed without
+ * re-typing it, and it is never read back.
+ */
+export async function saveAssistConfig(
+  config: AssistConfig,
+  apiKey?: string,
+): Promise<void> {
+  return invoke("save_assist_config", { config, apiKey: apiKey ?? null });
+}
+
+export async function clearAssistConfig(): Promise<void> {
+  return invoke("clear_assist_config");
+}
+
+/** Confirms the configured model answers, before a diagnosis depends on it. */
+export async function testAssistConnection(
+  config: AssistConfig,
+  apiKey?: string,
+): Promise<string> {
+  return invoke<string>("test_assist_connection", { config, apiKey: apiKey ?? null });
+}
+
+/* --------------------------------------------------------------------- cases */
+
+/**
+ * Opens a diagnosis from a symptom in the user's own words.
+ *
+ * Returns immediately with the case id; the work streams on `assist://progress`
+ * and can run for minutes, including a deliberate pause while the user
+ * reproduces the problem.
+ */
+export async function startCase(symptom: string): Promise<string> {
+  return invoke<string>("start_case", { symptom });
+}
+
+/** Answers the question a case stopped on, and resumes it. */
+export async function answerCase(id: string, text: string): Promise<void> {
+  return invoke("answer_case", { id, text });
+}
+
+/** Stops the running diagnosis. Evidence gathered so far is kept. */
+export async function cancelCase(): Promise<boolean> {
+  return invoke<boolean>("cancel_case");
+}
+
+/** The open case, if any — so a reopened window rejoins one already going. */
+export async function getRunningCase(): Promise<string | null> {
+  return invoke<string | null>("get_running_case");
+}
+
+export async function listCases(limit = 25): Promise<CaseSummary[]> {
+  return invoke<CaseSummary[]>("list_cases", { limit });
+}
+
+export async function getCase(id: string): Promise<TroubleshootingCase | null> {
+  return invoke<TroubleshootingCase | null>("get_case", { id });
+}
+
+export async function deleteCase(id: string): Promise<boolean> {
+  return invoke<boolean>("delete_case", { id });
+}
+
+/** Subscribes to live diagnosis progress. Returns an unsubscribe function. */
+export async function onAssistEvent(
+  handler: (event: AssistEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<AssistEvent>("assist://progress", (message) => handler(message.payload));
 }
 
 /* ------------------------------------------------------------------ networks */
@@ -169,8 +275,11 @@ export async function detectNetwork(): Promise<Detection> {
   return invoke<Detection>("detect_network");
 }
 
-export async function createNetwork(name: string): Promise<NetworkProfile> {
-  return invoke<NetworkProfile>("create_network", { name });
+export async function createNetwork(
+  name: string,
+  locationId?: string,
+): Promise<NetworkProfile> {
+  return invoke<NetworkProfile>("create_network", { name, locationId: locationId ?? null });
 }
 
 export async function switchNetwork(id: string): Promise<void> {
@@ -183,6 +292,28 @@ export async function renameNetwork(id: string, name: string): Promise<void> {
 
 export async function deleteNetwork(id: string): Promise<void> {
   return invoke("delete_network", { id });
+}
+
+/** Creates a location, or returns the existing one with that name. */
+export async function createLocation(name: string): Promise<Location> {
+  return invoke<Location>("create_location", { name });
+}
+
+export async function renameLocation(id: string, name: string): Promise<void> {
+  return invoke("rename_location", { id, name });
+}
+
+/**
+ * Removes a location and returns how many networks moved to "no location".
+ * The networks themselves, and their scans, are kept.
+ */
+export async function deleteLocation(id: string): Promise<number> {
+  return invoke<number>("delete_location", { id });
+}
+
+/** Files a network under a location, or takes it out of one with `undefined`. */
+export async function setNetworkLocation(id: string, locationId?: string): Promise<void> {
+  return invoke("set_network_location", { id, locationId: locationId ?? null });
 }
 
 /** Deletes a network's scans but keeps the network and its settings. */

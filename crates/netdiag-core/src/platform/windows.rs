@@ -16,7 +16,8 @@ use std::time::Duration;
 
 pub const ARP_TOOL: super::ToolRef = super::ToolRef {
     command: "arp",
-    remedy: "Ships with Windows. If missing, check that %SystemRoot%\\System32 is on PATH.",
+    remedy: "Ships with Windows. MAC addresses are read from the IP Helper API first, so this \
+             is only the fallback; if it is missing, check that %SystemRoot%\\System32 is on PATH.",
 };
 pub const PING_TOOL: super::ToolRef = super::ToolRef {
     command: "ping",
@@ -51,12 +52,99 @@ pub fn ping_supports_flood() -> bool {
     false
 }
 
+/// Reads the neighbour cache, preferring the IP Helper API over `arp -a`.
+///
+/// This is the single most important probe on the platform: a device's MAC is
+/// what yields its vendor, and the vendor is often the only evidence of what a
+/// device *is*. Parsing `arp -a` puts that behind a localised, column-aligned
+/// text table; `GetIpNetTable2` hands back typed rows instead, so nothing
+/// depends on the display language, and it reports the full cache rather than
+/// the subset `arp -a` prints.
+///
+/// The text parser stays as a fallback for the case where the API is refused.
 pub async fn neighbor_table() -> Vec<Neighbor> {
+    let from_api = neighbor_table_api();
+    if !from_api.is_empty() {
+        return from_api;
+    }
+
     let result = run("arp", &["-a"], Duration::from_secs(8)).await;
     if !result.has_output() {
         return Vec::new();
     }
     parse_arp_a(&result.stdout)
+}
+
+/// Reads the IPv4 neighbour cache through `GetIpNetTable2`.
+///
+/// Returns an empty vector on any failure, which sends [`neighbor_table`] to the
+/// `arp -a` fallback rather than losing MACs outright.
+fn neighbor_table_api() -> Vec<Neighbor> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIpNetTable2, MIB_IPNET_TABLE2,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+    let mut table: *mut MIB_IPNET_TABLE2 = std::ptr::null_mut();
+
+    // SAFETY: `table` is a valid out-pointer. On success the API hands back an
+    // allocation owned by the caller, which is released with `FreeMibTable`
+    // below; rows are read only up to the `NumEntries` count it reports, and
+    // `PhysicalAddress` is a fixed 32-byte array indexed by a length clamped to
+    // it. On failure nothing is allocated and there is nothing to release.
+    unsafe {
+        if GetIpNetTable2(AF_INET, &mut table) != 0 || table.is_null() {
+            return Vec::new();
+        }
+
+        let count = (*table).NumEntries as usize;
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), count);
+
+        let neighbors = rows
+            .iter()
+            .filter_map(|row| {
+                // `S_addr` holds the address in network order, so its native
+                // byte representation is already the four octets in order.
+                let ip = Ipv4Addr::from(row.Address.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes());
+                let length = (row.PhysicalAddressLength as usize).min(row.PhysicalAddress.len());
+                accept_neighbor(ip, &format_mac(&row.PhysicalAddress[..length]))
+            })
+            .collect();
+
+        FreeMibTable(table as *const core::ffi::c_void);
+        neighbors
+    }
+}
+
+fn format_mac(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// Turns one neighbour-cache row into a [`Neighbor`], dropping those that carry
+/// no identity: unresolved entries, and the multicast and broadcast rows every
+/// source of this table includes.
+pub(crate) fn accept_neighbor(ip: Ipv4Addr, mac: &str) -> Option<Neighbor> {
+    // Windows writes MACs with dashes; normalize_mac converts them to colons.
+    // `is_meaningless_mac` also rejects anything that is not 12 hex digits, so
+    // an unresolved entry — blank here, `---` in `arp -a` — never survives.
+    let normalized = crate::netutil::normalize_mac(mac);
+    if crate::netutil::is_meaningless_mac(&normalized)
+        || crate::netutil::is_multicast_mac(&normalized)
+    {
+        return None;
+    }
+    if ip.is_multicast() || ip.is_broadcast() || ip.is_unspecified() {
+        return None;
+    }
+
+    Some(Neighbor {
+        ip,
+        mac: normalized,
+    })
 }
 
 /// Parses `arp -a`. Rows look like:
@@ -74,31 +162,10 @@ pub(crate) fn parse_arp_a(output: &str) -> Vec<Neighbor> {
         let Ok(ip) = tokens[0].parse::<Ipv4Addr>() else {
             continue;
         };
-        let mac_token = tokens[1];
 
-        // Windows uses dashes; normalize_mac converts them to colons.
-        let normalized = crate::netutil::normalize_mac(mac_token);
-        let hex: String = normalized
-            .chars()
-            .filter(|c| c.is_ascii_hexdigit())
-            .collect();
-        if hex.len() != 12 {
-            continue;
+        if let Some(neighbor) = accept_neighbor(ip, tokens[1]) {
+            out.push(neighbor);
         }
-        if crate::netutil::is_meaningless_mac(&normalized)
-            || crate::netutil::is_multicast_mac(&normalized)
-        {
-            continue;
-        }
-        // Skip the 224.0.0.0/4 multicast and 255.255.255.255 rows Windows lists.
-        if ip.is_multicast() || ip.is_broadcast() {
-            continue;
-        }
-
-        out.push(Neighbor {
-            ip,
-            mac: normalized,
-        });
     }
 
     out
@@ -529,6 +596,37 @@ mod tests {
             "dashes must become colons"
         );
         assert_eq!(neighbors[1].mac, "24:62:ab:e4:5f:a4");
+    }
+
+    #[test]
+    fn formats_api_physical_addresses_as_colon_separated_macs() {
+        assert_eq!(
+            format_mac(&[0xe0, 0x63, 0xda, 0x82, 0x1b, 0x35]),
+            "e0:63:da:82:1b:35"
+        );
+        // A row with no resolved address yields an empty slice, which must not
+        // be mistaken for a MAC.
+        assert_eq!(accept_neighbor("10.0.3.1".parse().unwrap(), ""), None);
+    }
+
+    #[test]
+    fn accepts_only_rows_that_identify_a_device() {
+        let ip: Ipv4Addr = "10.0.3.22".parse().unwrap();
+        assert_eq!(
+            accept_neighbor(ip, "24-62-AB-E4-5F-A4").map(|n| n.mac),
+            Some("24:62:ab:e4:5f:a4".to_string()),
+            "dashes and upper case must normalise"
+        );
+        assert_eq!(
+            accept_neighbor("224.0.0.22".parse().unwrap(), "01-00-5e-00-00-16"),
+            None,
+            "multicast rows identify no device"
+        );
+        assert_eq!(
+            accept_neighbor("255.255.255.255".parse().unwrap(), "ff-ff-ff-ff-ff-ff"),
+            None
+        );
+        assert_eq!(accept_neighbor(ip, "---"), None, "unresolved entry");
     }
 
     #[test]

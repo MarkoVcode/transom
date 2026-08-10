@@ -258,7 +258,11 @@ pub fn extract_title(body: &str) -> Option<String> {
 /// legitimately present self-signed ones, and it never sends them anything. This
 /// one is for talking to a public service on the internet, where accepting any
 /// certificate would let anyone on the path impersonate it.
-fn verified_tls_config() -> Arc<ClientConfig> {
+/// Real certificate verification, for talking to the public internet.
+///
+/// Distinct from [`tls_config`], which accepts anything: that one exists to
+/// *inspect* LAN certificates and must not be used where credentials are sent.
+pub fn verified_tls_config() -> Arc<ClientConfig> {
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };

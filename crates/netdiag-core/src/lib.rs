@@ -19,6 +19,7 @@
 //!   snapshot, not an error. [`doctor`] explains exactly what was lost and why.
 
 pub mod adjacent;
+pub mod assist;
 pub mod doctor;
 pub mod exec;
 pub mod netutil;

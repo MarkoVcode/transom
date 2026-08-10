@@ -9,9 +9,10 @@ mod credentials;
 
 use netdiag_core::{
     adjacent,
+    assist::{self, AssistConfig},
     doctor::{self, DoctorReport},
     netutil,
-    networks::{self, Detection, NetworkIndex, NetworkProfile},
+    networks::{self, Detection, Location, NetworkIndex, NetworkProfile},
     scan,
     store::{self, Store},
     types::*,
@@ -28,6 +29,9 @@ use tokio::sync::Mutex;
 
 /// Channel the frontend listens on for live scan progress.
 const PROGRESS_EVENT: &str = "scan://progress";
+
+/// Channel the frontend listens on for live troubleshooting progress.
+const ASSIST_EVENT: &str = "assist://progress";
 
 #[derive(Default)]
 struct AutoRepeat {
@@ -63,6 +67,10 @@ struct AppState {
     /// current view and may change mid-scan, while this is what the scan is
     /// actually doing and must not.
     scanning_network: Mutex<Option<ScanNetwork>>,
+    /// The diagnosis in flight. One at a time: each holds a controller session
+    /// open and can ask the user to reproduce a fault, and two of those running
+    /// against each other would measure each other.
+    assist_running: Mutex<Option<AssistHandle>>,
 }
 
 /// The network a scan is bound to, resolved once when it starts.
@@ -164,6 +172,7 @@ impl AppState {
             last_snapshot_id: Mutex::new(None),
             started: tokio::sync::OnceCell::new(),
             scanning_network: Mutex::new(None),
+            assist_running: Mutex::new(None),
         }
     }
 }
@@ -880,12 +889,22 @@ struct NetworkEntry {
 #[serde(rename_all = "camelCase")]
 struct NetworkList {
     active: Option<String>,
+    /// Already in display order, so every view groups identically without
+    /// re-deriving the rule.
+    locations: Vec<Location>,
     networks: Vec<NetworkEntry>,
 }
 
 #[tauri::command]
 async fn list_networks(state: State<'_, Arc<AppState>>) -> Result<NetworkList, String> {
     let index = NetworkIndex::load(state.settings_root()).await;
+
+    // Before the loop below, which consumes `index.networks`.
+    let locations: Vec<Location> = index
+        .locations_sorted()
+        .into_iter()
+        .cloned()
+        .collect();
 
     let mut networks = Vec::with_capacity(index.networks.len());
     for profile in index.networks {
@@ -899,6 +918,7 @@ async fn list_networks(state: State<'_, Arc<AppState>>) -> Result<NetworkList, S
 
     Ok(NetworkList {
         active: state.active_network_id().await.or(index.active),
+        locations,
         networks,
     })
 }
@@ -927,6 +947,7 @@ async fn detect_network(state: State<'_, Arc<AppState>>) -> Result<Detection, St
 async fn create_network(
     state: State<'_, Arc<AppState>>,
     name: String,
+    location_id: Option<String>,
 ) -> Result<NetworkProfile, String> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -937,6 +958,12 @@ async fn create_network(
 
     let root = state.settings_root();
     let mut index = NetworkIndex::load(root).await;
+
+    if let Some(location_id) = &location_id {
+        if index.location(location_id).is_none() {
+            return Err("No such location".into());
+        }
+    }
 
     if let Some(existing) = index.networks.iter().find(|profile| {
         networks::match_strength(&profile.fingerprint, &fingerprint)
@@ -954,6 +981,7 @@ async fn create_network(
     // Read the profile back rather than returning the one handed in: `add`
     // rewrites the id if it would collide with an existing directory.
     let id = index.add(NetworkProfile::new(name, fingerprint));
+    index.assign_location(&id, location_id.as_deref())?;
     let profile = index.get(&id).cloned().ok_or("network vanished")?;
     index.save(root).await?;
 
@@ -1043,6 +1071,60 @@ async fn rename_network(
         return Err("No such network".into());
     };
     profile.name = name;
+    index.save(root).await
+}
+
+/// Creates a location, or returns the existing one with that name.
+///
+/// The whole location is returned so the caller can file a network under it
+/// immediately, without a round trip to re-list.
+#[tauri::command]
+async fn create_location(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+) -> Result<Location, String> {
+    let root = state.settings_root();
+    let mut index = NetworkIndex::load(root).await;
+    let id = index.add_location(&name)?;
+    let location = index.location(&id).cloned().ok_or("location vanished")?;
+    index.save(root).await?;
+    Ok(location)
+}
+
+#[tauri::command]
+async fn rename_location(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    let root = state.settings_root();
+    let mut index = NetworkIndex::load(root).await;
+    index.rename_location(&id, &name)?;
+    index.save(root).await
+}
+
+/// Removes a location. Returns how many networks moved to "no location".
+///
+/// Nothing is deleted but the label itself: the networks it grouped, and every
+/// scan they hold, are left exactly as they were.
+#[tauri::command]
+async fn delete_location(state: State<'_, Arc<AppState>>, id: String) -> Result<usize, String> {
+    let root = state.settings_root();
+    let mut index = NetworkIndex::load(root).await;
+    let detached = index.delete_location(&id)?;
+    index.save(root).await?;
+    Ok(detached)
+}
+
+#[tauri::command]
+async fn set_network_location(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    location_id: Option<String>,
+) -> Result<(), String> {
+    let root = state.settings_root();
+    let mut index = NetworkIndex::load(root).await;
+    index.assign_location(&id, location_id.as_deref())?;
     index.save(root).await
 }
 
@@ -1406,6 +1488,390 @@ async fn delete_network(state: State<'_, Arc<AppState>>, id: String) -> Result<(
     Ok(())
 }
 
+/* --------------------------------------------------------------- assistant */
+
+/// The assistant's settings, plus whether a key is on file.
+///
+/// The key itself is never returned — only whether one exists, which is what
+/// the UI needs to decide between "Save" and "Replace".
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AssistSettings {
+    #[serde(flatten)]
+    config: AssistConfig,
+    has_key: bool,
+}
+
+/// Settings are per installation, not per network: which model to use is about
+/// this machine and its operator, not the site being diagnosed.
+#[tauri::command]
+async fn get_assist_config(state: State<'_, Arc<AppState>>) -> Result<AssistSettings, String> {
+    let config = AssistConfig::load(state.settings_root())
+        .await
+        .unwrap_or_default();
+    let has_key = credentials::load_assist_key(&config.credential_id())
+        .unwrap_or(None)
+        .is_some();
+
+    Ok(AssistSettings { config, has_key })
+}
+
+/// Saves settings, and the API key when one is supplied.
+///
+/// The key is optional so the model or endpoint can be changed without
+/// re-typing it — the same shape as the controller settings, and for the same
+/// reason: it is never read back to the frontend.
+#[tauri::command]
+async fn save_assist_config(
+    state: State<'_, Arc<AppState>>,
+    config: AssistConfig,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
+        credentials::store_assist_key(&config.credential_id(), key.trim())?;
+    }
+    config.save(state.settings_root()).await
+}
+
+#[tauri::command]
+async fn clear_assist_config(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let config = AssistConfig::load(state.settings_root())
+        .await
+        .unwrap_or_default();
+    // Clear the credential before the settings that identify it, or the
+    // keychain entry is orphaned with no way to find it again.
+    let _ = credentials::clear_assist_key(&config.credential_id());
+    AssistConfig::delete(state.settings_root()).await
+}
+
+/// Confirms the configured model answers.
+///
+/// Worth its own button for the same reason the controller has one: an
+/// unusable credential should surface here, not part-way through a diagnosis.
+#[tauri::command]
+async fn test_assist_connection(
+    state: State<'_, Arc<AppState>>,
+    config: AssistConfig,
+    api_key: Option<String>,
+) -> Result<String, String> {
+    let key = match api_key.filter(|key| !key.trim().is_empty()) {
+        Some(key) => Some(key),
+        None => credentials::load_assist_key(&config.credential_id())?,
+    };
+
+    let _ = state;
+    assist::verify(&config, key)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/* ------------------------------------------------------------------- cases */
+
+/// The open diagnosis, and the switch that stops it.
+///
+/// Retained while the case waits for an answer, not only while the model is
+/// working: the question may be answered minutes later, possibly after the user
+/// has switched networks to look at something else, and the answer still has to
+/// reach the case that asked it.
+struct AssistHandle {
+    case_id: String,
+    /// The network the case belongs to, held by value for the same reason
+    /// [`ScanNetwork`] is: a case must keep reading and writing its own
+    /// network's data even if the user switches view mid-diagnosis.
+    network: AssistNetwork,
+    cancel: assist::Cancel,
+    /// True once the loop has stopped on a question. The model is not running,
+    /// so this does not block a new case — but the binding above still matters.
+    waiting: bool,
+}
+
+#[derive(Clone)]
+struct AssistNetwork {
+    id: String,
+    root: std::path::PathBuf,
+    name: String,
+    subnets: Vec<String>,
+}
+
+/// A progress event with the case it belongs to.
+///
+/// The identity travels with the event for the reason [`ScanEvent`] learned the
+/// hard way: a UI that labels progress with whatever is *selected* mislabels
+/// everything the moment the user switches network mid-run.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AssistProgress {
+    case_id: String,
+    network_id: String,
+    #[serde(flatten)]
+    event: assist::AssistEvent,
+}
+
+/// Resolves the active network into everything a case needs to know about it.
+async fn assist_network(state: &Arc<AppState>) -> Result<AssistNetwork, String> {
+    let profile = state
+        .active_profile()
+        .await
+        .ok_or("Select a network before starting a diagnosis.")?;
+
+    Ok(AssistNetwork {
+        root: NetworkIndex::network_dir(state.settings_root(), &profile.id),
+        subnets: profile.fingerprint.subnets.clone(),
+        name: profile.name,
+        id: profile.id,
+    })
+}
+
+/// Assembles the tool context, including the controller password.
+///
+/// Reading the credential here rather than in the engine is the same division
+/// the scanner uses: the core crate holds no secrets and needs no keychain.
+async fn assist_context(
+    state: &Arc<AppState>,
+    network: &AssistNetwork,
+) -> netdiag_core::assist::ToolContext {
+    let unifi = match UnifiConfig::load(&network.root).await {
+        Some(config) if config.is_configured() => credentials::load(&config)
+            .ok()
+            .map(|password| (config, password)),
+        _ => None,
+    };
+
+    // Read here rather than carried in: the setting is system-scoped, and a
+    // case that started before the user turned redaction on should honour the
+    // switch as it stands when the work is actually done.
+    let redact = AssistConfig::load(state.settings_root())
+        .await
+        .map(|config| config.redact)
+        .unwrap_or(true);
+
+    netdiag_core::assist::ToolContext {
+        store: Store::new(NetworkIndex::scans_dir(state.settings_root(), &network.id)),
+        network_name: network.name.clone(),
+        network_subnets: network.subnets.clone(),
+        unifi,
+        network_root: network.root.clone(),
+        redactor: std::sync::Mutex::new(netdiag_core::assist::Redactor::new(redact)),
+    }
+}
+
+/// Builds the configured provider, refusing clearly when it is not usable.
+async fn assist_provider(
+    state: &Arc<AppState>,
+) -> Result<Box<dyn netdiag_core::assist::DynChatProvider>, String> {
+    let config = AssistConfig::load(state.settings_root())
+        .await
+        .unwrap_or_default();
+
+    if !config.enabled {
+        return Err(
+            "The troubleshooting assistant is switched off. Turn it on under Setup.".into(),
+        );
+    }
+
+    let key = credentials::load_assist_key(&config.credential_id())?;
+    assist::build(&config, key)
+}
+
+/// Runs a case to its next stopping point, streaming progress.
+///
+/// Spawned rather than awaited: a diagnosis takes minutes and includes a
+/// deliberate pause while the user reproduces the problem, so holding the
+/// command open would freeze the UI that has to display it.
+fn spawn_case(
+    app: AppHandle,
+    state: Arc<AppState>,
+    mut case: assist::Case,
+    network: AssistNetwork,
+    provider: Box<dyn netdiag_core::assist::DynChatProvider>,
+    cancel: assist::Cancel,
+) {
+    tauri::async_runtime::spawn(async move {
+        let ctx = assist_context(&state, &network).await;
+
+        // The loop's callback is synchronous, so events go through a channel
+        // and a forwarding task that can await the emit — the same shape the
+        // scanner uses.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AssistProgress>();
+        let emitter = app.clone();
+        let forward = tauri::async_runtime::spawn(async move {
+            while let Some(progress) = rx.recv().await {
+                let _ = emitter.emit(ASSIST_EVENT, &progress);
+            }
+        });
+
+        let case_id = case.id.clone();
+        let network_id = network.id.clone();
+        assist::session::run(
+            &mut case,
+            provider.as_ref(),
+            &ctx,
+            assist::Limits::default(),
+            &cancel,
+            &mut |event| {
+                let _ = tx.send(AssistProgress {
+                    case_id: case_id.clone(),
+                    network_id: network_id.clone(),
+                    event,
+                });
+            },
+        )
+        .await;
+
+        drop(tx);
+        let _ = forward.await;
+
+        // Saved once more at the end: the loop saves per step, but the final
+        // status and remedy land after the last one.
+        let _ = case.save(&network.root).await;
+
+        let mut running = state.assist_running.lock().await;
+        if running.as_ref().map(|handle| handle.case_id.as_str()) == Some(case.id.as_str()) {
+            match case.status {
+                // Still open — hold the binding so the answer reaches it.
+                netdiag_core::assist::CaseStatus::WaitingForAnswer => {
+                    if let Some(handle) = running.as_mut() {
+                        handle.waiting = true;
+                    }
+                }
+                _ => *running = None,
+            }
+        }
+    });
+}
+
+/// Opens a case from a symptom described in the user's own words.
+#[tauri::command]
+async fn start_case(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    symptom: String,
+) -> Result<String, String> {
+    let symptom = symptom.trim().to_string();
+    if symptom.is_empty() {
+        return Err("Describe what is going wrong before starting.".into());
+    }
+
+    let state = Arc::clone(&state);
+    // A waiting case is not occupying anything, so it does not block a new one.
+    if state
+        .assist_running
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|handle| !handle.waiting)
+    {
+        return Err("A diagnosis is already running. Stop it before starting another.".into());
+    }
+
+    let network = assist_network(&state).await?;
+    let provider = assist_provider(&state).await?;
+
+    let case = assist::Case::new(&network.id, symptom);
+    case.save(&network.root).await?;
+
+    let cancel: assist::Cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    *state.assist_running.lock().await = Some(AssistHandle {
+        case_id: case.id.clone(),
+        network: network.clone(),
+        cancel: Arc::clone(&cancel),
+        waiting: false,
+    });
+
+    let id = case.id.clone();
+    spawn_case(app, state, case, network, provider, cancel);
+    Ok(id)
+}
+
+/// Answers the question a case is waiting on and resumes it.
+#[tauri::command]
+async fn answer_case(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    text: String,
+) -> Result<(), String> {
+    let state = Arc::clone(&state);
+
+    // The case's own network, not whatever is selected now. Resolving through
+    // the selection is what made scans file themselves into the wrong history;
+    // an answer routed that way would look for the case where it never was.
+    let network = match state.assist_running.lock().await.as_ref() {
+        Some(handle) if handle.case_id == id => handle.network.clone(),
+        _ => assist_network(&state).await?,
+    };
+
+    let mut case = assist::Case::load(&network.root, &id)
+        .await
+        .ok_or("That diagnosis is no longer stored.")?;
+
+    if !assist::session::answer(&mut case, text) {
+        return Err("That diagnosis is not waiting for an answer.".into());
+    }
+    case.save(&network.root).await?;
+
+    let provider = assist_provider(&state).await?;
+    let cancel: assist::Cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    *state.assist_running.lock().await = Some(AssistHandle {
+        case_id: case.id.clone(),
+        network: network.clone(),
+        cancel: Arc::clone(&cancel),
+        waiting: false,
+    });
+
+    spawn_case(app, state, case, network, provider, cancel);
+    Ok(())
+}
+
+/// Stops the running diagnosis. The evidence gathered so far is kept.
+#[tauri::command]
+async fn cancel_case(state: State<'_, Arc<AppState>>) -> Result<bool, String> {
+    match state.assist_running.lock().await.as_ref() {
+        Some(handle) => {
+            handle
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// The case currently running, if any — so a reopened window can rejoin one.
+#[tauri::command]
+async fn get_running_case(state: State<'_, Arc<AppState>>) -> Result<Option<String>, String> {
+    Ok(state
+        .assist_running
+        .lock()
+        .await
+        .as_ref()
+        .map(|handle| handle.case_id.clone()))
+}
+
+#[tauri::command]
+async fn list_cases(
+    state: State<'_, Arc<AppState>>,
+    limit: usize,
+) -> Result<Vec<assist::CaseSummary>, String> {
+    let root = state.network_root().await;
+    Ok(assist::Case::list(&root, limit.clamp(1, 200)).await)
+}
+
+#[tauri::command]
+async fn get_case(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<Option<assist::Case>, String> {
+    let root = state.network_root().await;
+    Ok(assist::Case::load(&root, &id).await)
+}
+
+#[tauri::command]
+async fn delete_case(state: State<'_, Arc<AppState>>, id: String) -> Result<bool, String> {
+    let root = state.network_root().await;
+    Ok(assist::Case::delete(&root, &id).await)
+}
+
 /* ----------------------------------------------------------- update checking */
 
 #[tauri::command]
@@ -1515,6 +1981,57 @@ async fn test_unifi_connection(
             ""
         }
     ))
+}
+
+/// Which diagnostics this controller can actually support.
+///
+/// UniFi releases differ in what they report, so a detector can be correct and
+/// still never fire. Answering that here means an empty result can be read as
+/// "nothing found" rather than silently meaning "never checked". Every
+/// collection the requirements name is queried, so the answer covers the whole
+/// diagnostic surface rather than one endpoint's worth of it.
+///
+/// `save_to` writes the raw payloads out for inspection. Opt-in and never
+/// automatic: they carry MACs, hostnames and SSIDs, and belong wherever the
+/// user chose rather than in the app's own data directory.
+#[tauri::command]
+async fn check_controller_fields(
+    state: State<'_, Arc<AppState>>,
+    save_to: Option<String>,
+) -> Result<Vec<unifi::DiagnosticCoverage>, String> {
+    let network_root = state.network_root().await;
+    let config = UnifiConfig::load(&network_root)
+        .await
+        .filter(|config| config.is_configured())
+        .ok_or("No controller is configured for this network")?;
+    let password = credentials::load(&config)?;
+
+    let mut endpoints: Vec<&str> = unifi::DIAGNOSTIC_REQUIREMENTS
+        .iter()
+        .map(|requirement| requirement.endpoint)
+        .collect();
+    endpoints.sort_unstable();
+    endpoints.dedup();
+
+    let mut coverage = Vec::new();
+    let mut raw = serde_json::Map::new();
+
+    for endpoint in endpoints {
+        let data = unifi::dump_endpoint(&config, &password, endpoint)
+            .await
+            .map_err(|e| unifi::config::redact(&e.to_string()))?;
+        coverage.extend(unifi::report_diagnostic_coverage(&data, endpoint));
+        raw.insert(endpoint.to_string(), data);
+    }
+
+    if let Some(path) = save_to {
+        let pretty = serde_json::to_vec_pretty(&raw).map_err(|e| e.to_string())?;
+        tokio::fs::write(&path, pretty)
+            .await
+            .map_err(|e| format!("Could not write {path}: {e}"))?;
+    }
+
+    Ok(coverage)
 }
 
 #[tauri::command]
@@ -1790,6 +2307,10 @@ pub fn run() {
             switch_network,
             refresh_network_fingerprint,
             rename_network,
+            create_location,
+            rename_location,
+            delete_location,
+            set_network_location,
             clear_network_history,
             preview_scan_targets,
             discover_local_networks,
@@ -1801,6 +2322,18 @@ pub fn run() {
             save_unifi_config,
             clear_unifi_config,
             test_unifi_connection,
+            check_controller_fields,
+            get_assist_config,
+            save_assist_config,
+            clear_assist_config,
+            test_assist_connection,
+            start_case,
+            answer_case,
+            cancel_case,
+            get_running_case,
+            list_cases,
+            get_case,
+            delete_case,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the application");

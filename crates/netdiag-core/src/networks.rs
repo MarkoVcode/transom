@@ -145,6 +145,13 @@ pub struct NetworkProfile {
     pub last_seen_at: Option<String>,
     #[serde(default)]
     pub scan_count: usize,
+    /// The place this network belongs to, if any.
+    ///
+    /// An id rather than the name, so renaming the location does not have to
+    /// touch every network in it — and so two spellings of one place cannot
+    /// quietly become two groups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location_id: Option<String>,
 }
 
 impl NetworkProfile {
@@ -156,6 +163,7 @@ impl NetworkProfile {
             created_at: chrono::Utc::now().to_rfc3339(),
             last_seen_at: None,
             scan_count: 0,
+            location_id: None,
         }
     }
 }
@@ -170,7 +178,11 @@ impl NetworkProfile {
 /// created in the same millisecond got identical ids on macOS. Two networks
 /// sharing an id share a directory, which merges their histories: precisely the
 /// failure this module exists to prevent.
-fn new_id() -> String {
+///
+/// Locations share the generator — and therefore the one counter — so the same
+/// reasoning covers both. Only the prefix differs, which makes a stale id
+/// obvious to anyone reading the file.
+fn timestamped_id(prefix: &str) -> String {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
     let now = chrono::Utc::now();
@@ -181,11 +193,19 @@ fn new_id() -> String {
     let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     format!(
-        "net-{}-{:05}-{:04x}",
+        "{prefix}-{}-{:05}-{:04x}",
         now.format("%Y%m%d-%H%M%S"),
         nanos % 100_000,
         sequence & 0xffff
     )
+}
+
+fn new_id() -> String {
+    timestamped_id("net")
+}
+
+fn new_location_id() -> String {
+    timestamped_id("loc")
 }
 
 /// What the app should do about the network it is currently attached to.
@@ -221,12 +241,38 @@ pub struct NetworkCandidate {
     pub strength: MatchStrength,
 }
 
+/// A named place several networks belong to — a site, a building, a client.
+///
+/// One address often has more than one network: a main LAN, a guest SSID and a
+/// lab VLAN are three separate histories that are nonetheless the same place.
+/// This is a label for that, and deliberately nothing more: it never owns a
+/// network, so removing it can never take a scan history with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Location {
+    pub id: String,
+    pub name: String,
+}
+
+impl Location {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            id: new_location_id(),
+            name: name.into(),
+        }
+    }
+}
+
 /// The saved networks and which one is selected.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkIndex {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active: Option<String>,
+    /// Named places, in creation order. Sorting happens at display time so the
+    /// file stays stable and diffable across renames.
+    #[serde(default)]
+    pub locations: Vec<Location>,
     pub networks: Vec<NetworkProfile>,
 }
 
@@ -245,10 +291,15 @@ impl NetworkIndex {
     }
 
     pub async fn load(root: &Path) -> Self {
-        match tokio::fs::read(Self::index_path(root)).await {
+        let mut index: Self = match tokio::fs::read(Self::index_path(root)).await {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(_) => Self::default(),
-        }
+        };
+        // In memory only — a read path does not write. The repair reaches disk
+        // on whatever save comes next, and until then every caller at least
+        // agrees about what the index contains.
+        index.heal();
+        index
     }
 
     pub async fn save(&self, root: &Path) -> Result<(), String> {
@@ -297,6 +348,135 @@ impl NetworkIndex {
         self.networks.push(profile);
         self.active = Some(id.clone());
         id
+    }
+
+    /* --------------------------------------------------------------- locations */
+
+    pub fn location(&self, id: &str) -> Option<&Location> {
+        self.locations.iter().find(|location| location.id == id)
+    }
+
+    /// Looks a location up by what the user typed — trimmed, and ignoring case.
+    pub fn location_by_name(&self, name: &str) -> Option<&Location> {
+        let name = name.trim();
+        self.locations
+            .iter()
+            .find(|location| location.name.trim().eq_ignore_ascii_case(name))
+    }
+
+    /// Creates a location, or returns the id of the one that already has this
+    /// name.
+    ///
+    /// Deliberately idempotent. The whole reason a location is a record rather
+    /// than a free-text label is that "Office" and "office" must not become two
+    /// groups, and creation is the path a typo takes.
+    pub fn add_location(&mut self, name: &str) -> Result<String, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("A location needs a name".into());
+        }
+
+        if let Some(existing) = self.location_by_name(name) {
+            return Ok(existing.id.clone());
+        }
+
+        let location = Location::new(name);
+        let id = location.id.clone();
+        self.locations.push(location);
+        Ok(id)
+    }
+
+    /// Refused when another location already has the name.
+    ///
+    /// Merging the two would be the obvious alternative, and it is not what
+    /// "rename" means — nor is it undoable once the networks have moved.
+    pub fn rename_location(&mut self, id: &str, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("A location needs a name".into());
+        }
+
+        if let Some(clash) = self.location_by_name(name) {
+            if clash.id != id {
+                return Err(format!("A location called \"{}\" already exists", clash.name));
+            }
+        }
+
+        let location = self
+            .locations
+            .iter_mut()
+            .find(|location| location.id == id)
+            .ok_or("No such location")?;
+        location.name = name.to_string();
+        Ok(())
+    }
+
+    /// Removes the location and detaches the networks in it. Returns how many
+    /// were detached, so the user can be told before it happens.
+    ///
+    /// The networks and their scan histories are untouched: a grouping label
+    /// must never be able to delete the thing it labels.
+    pub fn delete_location(&mut self, id: &str) -> Result<usize, String> {
+        if self.location(id).is_none() {
+            return Err("No such location".into());
+        }
+
+        self.locations.retain(|location| location.id != id);
+
+        let mut detached = 0;
+        for profile in &mut self.networks {
+            if profile.location_id.as_deref() == Some(id) {
+                profile.location_id = None;
+                detached += 1;
+            }
+        }
+        Ok(detached)
+    }
+
+    /// Puts a network in a location, or takes it out of one with `None`.
+    ///
+    /// An unknown location id is refused rather than stored: a network filed
+    /// under a group nothing renders would simply disappear from the list.
+    pub fn assign_location(
+        &mut self,
+        network_id: &str,
+        location_id: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(location_id) = location_id {
+            if self.location(location_id).is_none() {
+                return Err("No such location".into());
+            }
+        }
+
+        let profile = self.get_mut(network_id).ok_or("No such network")?;
+        profile.location_id = location_id.map(|id| id.to_string());
+        Ok(())
+    }
+
+    /// Display order: by name, ignoring case, with the id as a tie-break so it
+    /// is deterministic. Derived once here so no two views can disagree.
+    pub fn locations_sorted(&self) -> Vec<&Location> {
+        let mut sorted: Vec<&Location> = self.locations.iter().collect();
+        sorted.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        sorted
+    }
+
+    /// Clears location ids that point at nothing.
+    fn heal(&mut self) {
+        for profile in &mut self.networks {
+            let dangling = profile
+                .location_id
+                .as_deref()
+                .is_some_and(|id| !self.locations.iter().any(|location| location.id == id));
+            if dangling {
+                profile.location_id = None;
+            }
+        }
     }
 
     /// Decides what to do about an observed fingerprint.
@@ -693,6 +873,169 @@ mod tests {
             "two networks must never share a directory"
         );
         assert_eq!(index.networks.len(), 2);
+    }
+
+    /* ------------------------------------------------------------- locations */
+
+    fn with_networks(names: &[&str]) -> NetworkIndex {
+        let mut index = NetworkIndex::default();
+        for name in names {
+            index
+                .networks
+                .push(NetworkProfile::new(*name, NetworkFingerprint::default()));
+        }
+        index
+    }
+
+    #[test]
+    fn creating_a_location_that_differs_only_in_case_reuses_the_existing_one() {
+        // The guarantee that makes a location a record rather than a label: one
+        // place cannot become two groups because of how it was typed.
+        let mut index = NetworkIndex::default();
+        let first = index.add_location("Head office").unwrap();
+        let second = index.add_location("  head OFFICE ").unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(index.locations.len(), 1);
+        assert_eq!(index.locations[0].name, "Head office", "the first spelling wins");
+    }
+
+    #[test]
+    fn a_blank_location_name_is_refused() {
+        let mut index = NetworkIndex::default();
+        assert!(index.add_location("   ").is_err());
+        assert!(index.locations.is_empty());
+
+        let id = index.add_location("Home").unwrap();
+        assert!(index.rename_location(&id, "\t").is_err());
+        assert_eq!(index.locations[0].name, "Home");
+    }
+
+    #[test]
+    fn renaming_a_location_to_a_name_already_taken_is_refused() {
+        let mut index = NetworkIndex::default();
+        let home = index.add_location("Home").unwrap();
+        index.add_location("Office").unwrap();
+
+        // Merging is the tempting alternative, and it cannot be undone.
+        assert!(index.rename_location(&home, "office").is_err());
+        assert_eq!(index.locations.len(), 2);
+        assert_eq!(index.location(&home).unwrap().name, "Home");
+    }
+
+    #[test]
+    fn renaming_a_location_leaves_its_networks_alone() {
+        let mut index = with_networks(&["LAN", "Guest"]);
+        let id = index.add_location("Office").unwrap();
+        let lan = index.networks[0].id.clone();
+        index.assign_location(&lan, Some(&id)).unwrap();
+
+        index.rename_location(&id, "Head office").unwrap();
+
+        // Nothing stores the name, so one edit renames the group everywhere.
+        assert_eq!(index.get(&lan).unwrap().location_id.as_deref(), Some(id.as_str()));
+        assert_eq!(index.location(&id).unwrap().name, "Head office");
+    }
+
+    #[test]
+    fn deleting_a_location_keeps_the_networks_in_it() {
+        let mut index = with_networks(&["LAN", "Guest", "Elsewhere"]);
+        let id = index.add_location("Office").unwrap();
+        let ids: Vec<String> = index.networks.iter().take(2).map(|n| n.id.clone()).collect();
+        for network in &ids {
+            index.assign_location(network, Some(&id)).unwrap();
+        }
+
+        assert_eq!(index.delete_location(&id).unwrap(), 2);
+
+        assert_eq!(index.networks.len(), 3, "a label must not delete what it labels");
+        assert!(index.networks.iter().all(|n| n.location_id.is_none()));
+        assert!(index.location(&id).is_none());
+    }
+
+    #[test]
+    fn assigning_an_unknown_location_is_refused() {
+        let mut index = with_networks(&["LAN"]);
+        let lan = index.networks[0].id.clone();
+
+        assert!(index.assign_location(&lan, Some("loc-nope")).is_err());
+        assert!(
+            index.get(&lan).unwrap().location_id.is_none(),
+            "a network filed under a group nothing renders would vanish from the list"
+        );
+    }
+
+    #[test]
+    fn a_location_id_pointing_at_nothing_is_cleared_on_load() {
+        let mut index = with_networks(&["LAN"]);
+        index.networks[0].location_id = Some("loc-deleted".into());
+
+        index.heal();
+
+        assert!(index.networks[0].location_id.is_none());
+    }
+
+    #[test]
+    fn location_ids_do_not_collide_when_minted_in_the_same_instant() {
+        let locations: std::collections::HashSet<String> =
+            (0..1000).map(|_| new_location_id()).collect();
+        assert_eq!(locations.len(), 1000);
+
+        // The shared counter is what makes one generator safe for both kinds;
+        // the prefix is what keeps a misplaced id obvious.
+        let networks: std::collections::HashSet<String> = (0..1000).map(|_| new_id()).collect();
+        assert!(locations.is_disjoint(&networks));
+    }
+
+    #[test]
+    fn an_index_written_before_locations_existed_still_loads() {
+        // Frozen on purpose: a round-trip through the current structs cannot
+        // catch a field that stopped being optional.
+        let legacy = r#"{
+            "active": "net-20240101-000000-00000-0000",
+            "networks": [
+                {
+                    "id": "net-20240101-000000-00000-0000",
+                    "name": "Home",
+                    "fingerprint": { "subnets": ["192.168.0.0/24"], "dnsServers": [] },
+                    "createdAt": "2024-01-01T00:00:00Z",
+                    "scanCount": 7
+                }
+            ]
+        }"#;
+
+        let index: NetworkIndex = serde_json::from_str(legacy).unwrap();
+        assert!(index.locations.is_empty());
+        assert_eq!(index.networks.len(), 1);
+        assert_eq!(index.networks[0].scan_count, 7);
+        assert!(index.networks[0].location_id.is_none());
+    }
+
+    #[test]
+    fn a_network_with_no_location_writes_no_location_id_key() {
+        let mut profile = NetworkProfile::new("Home", NetworkFingerprint::default());
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(!json.contains("locationId"));
+
+        profile.location_id = Some("loc-1".into());
+        let json = serde_json::to_string(&profile).unwrap();
+        // The TypeScript type depends on this exact spelling.
+        assert!(json.contains("\"locationId\":\"loc-1\""));
+    }
+
+    #[test]
+    fn locations_are_listed_by_name_regardless_of_how_they_were_typed() {
+        let mut index = NetworkIndex::default();
+        index.add_location("office").unwrap();
+        index.add_location("Attic").unwrap();
+        index.add_location("Home").unwrap();
+
+        let names: Vec<&str> = index
+            .locations_sorted()
+            .iter()
+            .map(|location| location.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Attic", "Home", "office"]);
     }
 
     #[test]

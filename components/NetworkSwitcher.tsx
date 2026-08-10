@@ -1,9 +1,13 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Button } from "./ui";
+import { Button, Icon } from "./ui";
 import * as api from "@/lib/api";
-import type { Detection, NetworkProfile } from "@/lib/types";
+import { groupByLocation } from "@/lib/networks";
+import type { Detection, Location, NetworkProfile } from "@/lib/types";
+
+/** Sentinel for the "create one" option in a location picker. Not an id. */
+export const NEW_LOCATION = "__new";
 
 /**
  * Picks which network's history is being viewed.
@@ -14,11 +18,13 @@ import type { Detection, NetworkProfile } from "@/lib/types";
  */
 export function NetworkSwitcher({
   networks,
+  locations,
   activeId,
   onSwitch,
   onManage,
 }: {
   networks: NetworkProfile[];
+  locations: Location[];
   activeId?: string;
   onSwitch: (id: string) => void;
   onManage: () => void;
@@ -43,6 +49,12 @@ export function NetworkSwitcher({
   }, [open]);
 
   const active = networks.find((n) => n.id === activeId);
+  const activeLocation = locations.find((l) => l.id === active?.locationId);
+
+  /* Headers only once there is a location to head. Someone who never files a
+     network under one sees exactly the flat list this was before. */
+  const groups = groupByLocation(networks, locations);
+  const grouped = locations.length > 0;
 
   // The controller integration is configured per network, so the label marks
   // exactly where controller data applies — and by absence, where it does not.
@@ -69,8 +81,8 @@ export function NetworkSwitcher({
         aria-haspopup="listbox"
         aria-expanded={open}
       >
-        <span aria-hidden style={{ color: "var(--series-1)" }}>
-          ◈
+        <span aria-hidden style={{ color: "var(--series-1)", display: "inline-flex" }}>
+          <Icon name="networks" size={15} />
         </span>
         <span className="min-w-0 flex-1">
           <span className="flex items-center gap-1.5">
@@ -79,14 +91,17 @@ export function NetworkSwitcher({
             </span>
             {active?.hasUnifi && unifiTag}
           </span>
+          {/* Where you are, without having to open the dropdown to find out. */}
           <span className="block truncate text-[11px]" style={{ color: "var(--text-muted)" }}>
             {active
-              ? `${active.scanCount} scan${active.scanCount === 1 ? "" : "s"}`
+              ? `${activeLocation ? `${activeLocation.name} · ` : ""}${active.scanCount} scan${
+                  active.scanCount === 1 ? "" : "s"
+                }`
               : "Create one to start"}
           </span>
         </span>
-        <span aria-hidden style={{ color: "var(--text-muted)" }}>
-          {open ? "▴" : "▾"}
+        <span aria-hidden style={{ color: "var(--text-muted)", display: "inline-flex" }}>
+          <Icon name={open ? "chevronUp" : "chevronDown"} size={13} />
         </span>
       </button>
 
@@ -102,36 +117,69 @@ export function NetworkSwitcher({
                 No networks yet
               </li>
             )}
-            {networks.map((network) => (
-              <li key={network.id}>
-                <button
-                  type="button"
-                  role="option"
-                  aria-selected={network.id === activeId}
-                  onClick={() => {
-                    setOpen(false);
-                    if (network.id !== activeId) onSwitch(network.id);
-                  }}
-                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-[var(--surface-1)]"
-                  style={{
-                    fontWeight: network.id === activeId ? 600 : 400,
-                  }}
-                >
-                  <span aria-hidden style={{ color: network.id === activeId ? "var(--series-1)" : "transparent" }}>
-                    ✓
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="flex items-center gap-1.5">
-                      <span className="min-w-0 truncate">{network.name}</span>
-                      {network.hasUnifi && unifiTag}
+            {groups.map((group) => {
+              const rows = group.networks.map((network) => (
+                <li key={network.id}>
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={network.id === activeId}
+                    onClick={() => {
+                      setOpen(false);
+                      if (network.id !== activeId) onSwitch(network.id);
+                    }}
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-[var(--surface-1)]"
+                    style={{
+                      fontWeight: network.id === activeId ? 600 : 400,
+                    }}
+                  >
+                    <span
+                      aria-hidden
+                      style={{
+                        color: network.id === activeId ? "var(--series-1)" : "transparent",
+                        display: "inline-flex",
+                      }}
+                    >
+                      <Icon name="check" size={13} />
                     </span>
-                    <span className="block truncate text-[11px]" style={{ color: "var(--text-muted)" }}>
-                      {network.fingerprint.subnets[0] ?? "unknown subnet"}
+                    <span className="min-w-0 flex-1">
+                      <span className="flex items-center gap-1.5">
+                        <span className="min-w-0 truncate">{network.name}</span>
+                        {network.hasUnifi && unifiTag}
+                      </span>
+                      <span
+                        className="block truncate text-[11px]"
+                        style={{ color: "var(--text-muted)" }}
+                      >
+                        {network.fingerprint.subnets[0] ?? "unknown subnet"}
+                      </span>
                     </span>
-                  </span>
-                </button>
-              </li>
-            ))}
+                  </button>
+                </li>
+              ));
+
+              if (!grouped) return rows;
+
+              const label = group.location?.name ?? "No location";
+              return (
+                /* A group is presentational scaffolding; the options inside it
+                   stay the listbox's options. */
+                <li key={group.location?.id ?? "unassigned"} role="presentation">
+                  <div
+                    className="sticky top-0 z-10 flex items-center gap-1 px-3 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wider"
+                    style={{ color: "var(--text-muted)", background: "var(--surface-raised)" }}
+                  >
+                    <span aria-hidden style={{ display: "inline-flex" }}>
+                      <Icon name="location" size={10} />
+                    </span>
+                    <span className="min-w-0 truncate">{label}</span>
+                  </div>
+                  <ul role="group" aria-label={label}>
+                    {rows}
+                  </ul>
+                </li>
+              );
+            })}
           </ul>
 
           <div className="border-t p-2" style={{ borderColor: "var(--border)" }}>
@@ -164,18 +212,37 @@ export function NetworkSwitcher({
  */
 export function NetworkPrompt({
   detection,
+  locations = [],
   onResolved,
   onDismiss,
 }: {
   detection: Detection;
+  locations?: Location[];
   onResolved: () => void;
   onDismiss: () => void;
 }) {
   const [name, setName] = useState(
     detection.kind === "unknown" ? detection.suggestedName : "",
   );
+  /* "" is no location, NEW_LOCATION opens the name field. Asked here because
+     this is the one moment the user demonstrably knows where they are. */
+  const [locationChoice, setLocationChoice] = useState("");
+  const [newLocationName, setNewLocationName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const needsLocationName = locationChoice === NEW_LOCATION && !newLocationName.trim();
+
+  /* Create the location first, then the network, so it is never briefly
+     ungrouped. If the network then fails, an empty location is left behind —
+     harmless, because creating by name is idempotent, so a retry reuses it. */
+  const createNetwork = async () => {
+    const locationId =
+      locationChoice === NEW_LOCATION
+        ? (await api.createLocation(newLocationName)).id
+        : locationChoice || undefined;
+    await api.createNetwork(name, locationId);
+  };
 
   const run = async (action: () => Promise<unknown>) => {
     setBusy(true);
@@ -227,8 +294,8 @@ export function NetworkPrompt({
               </Button>
               <Button
                 variant="primary"
-                onClick={() => run(() => api.createNetwork(name))}
-                disabled={busy || !name.trim()}
+                onClick={() => run(createNetwork)}
+                disabled={busy || !name.trim() || needsLocationName}
               >
                 Create
               </Button>
@@ -302,6 +369,54 @@ export function NetworkPrompt({
                   Something you will recognise later — “Home”, “Office”, a client name.
                 </span>
               </label>
+            )}
+
+            {/* One place often has several networks — a main LAN, a guest SSID,
+                a lab VLAN. Grouping them is easiest to get right now, while the
+                user is standing in the place in question. */}
+            {content.input && (
+              <div className="mt-3">
+                <label className="block">
+                  <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                    Location (optional)
+                  </span>
+                  <select
+                    value={locationChoice}
+                    onChange={(e) => setLocationChoice(e.target.value)}
+                    disabled={busy}
+                    className="mt-1 w-full rounded-lg border px-2 py-1.5 text-sm"
+                    style={{
+                      borderColor: "var(--border-strong)",
+                      background: "var(--surface-raised)",
+                      color: "var(--text-primary)",
+                    }}
+                  >
+                    <option value="">No location</option>
+                    {locations.map((location) => (
+                      <option key={location.id} value={location.id}>
+                        {location.name}
+                      </option>
+                    ))}
+                    <option value={NEW_LOCATION}>New location…</option>
+                  </select>
+                </label>
+                {locationChoice === NEW_LOCATION && (
+                  <input
+                    type="text"
+                    value={newLocationName}
+                    onChange={(e) => setNewLocationName(e.target.value)}
+                    placeholder="Head office, Flat, client site…"
+                    aria-label="New location name"
+                    disabled={busy}
+                    className="mt-2 w-full rounded-lg border px-2 py-1.5 text-sm"
+                    style={{
+                      borderColor: "var(--border-strong)",
+                      background: "var(--surface-raised)",
+                      color: "var(--text-primary)",
+                    }}
+                  />
+                )}
+              </div>
             )}
 
             {content.candidates && (

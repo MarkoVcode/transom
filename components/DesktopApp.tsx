@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 
+import { AssistantPanel } from "./AssistantPanel";
 import { ConnectivityPanel } from "./ConnectivityPanel";
 import { DeviceTable } from "./DeviceTable";
 import { HistoryPanel } from "./HistoryPanel";
@@ -23,6 +24,8 @@ import {
   Card,
   EmptyState,
   formatDuration,
+  Icon,
+  type IconName,
   formatRelativeTime,
   latencyTone,
   LoadingState,
@@ -30,6 +33,7 @@ import {
   signalTone,
   Spinner,
   StatusBadge,
+  StatusMark,
   type StatusTone,
 } from "./ui";
 import * as api from "@/lib/api";
@@ -39,6 +43,7 @@ import {
   type AdjacentSubnet,
   type Detection,
   type DiscoveredNetwork,
+  type Location,
   type NetworkList,
   type NetworkProfile,
   type AutoRepeatState,
@@ -55,29 +60,31 @@ type Section =
   | "connectivity"
   | "wifi"
   | "controller"
+  | "assistant"
   | "networks"
   | "host"
   | "history"
   | "setup";
 
-type NavItem = { id: Section; label: string; icon: string };
+type NavItem = { id: Section; label: string; icon: IconName; tag?: string };
 
 /* The nav is split by scope: everything in the network group changes meaning
  * when the dropdown above it changes; the system group describes this machine
  * and the app, whichever network is selected. */
 const NETWORK_NAV: NavItem[] = [
-  { id: "overview", label: "Overview", icon: "◉" },
-  { id: "devices", label: "Devices", icon: "▤" },
-  { id: "connectivity", label: "Connectivity", icon: "↭" },
-  { id: "wifi", label: "Wi-Fi", icon: "≋" },
-  { id: "controller", label: "Controller", icon: "⊞" },
-  { id: "history", label: "History", icon: "⟲" },
+  { id: "overview", label: "Overview", icon: "overview" },
+  { id: "devices", label: "Devices", icon: "devices" },
+  { id: "connectivity", label: "Connectivity", icon: "connectivity" },
+  { id: "wifi", label: "Wi-Fi", icon: "wifi" },
+  { id: "controller", label: "Controller", icon: "controller" },
+  { id: "history", label: "History", icon: "history" },
+  { id: "assistant", label: "Assistant", icon: "assistant", tag: "in development" },
 ];
 
 const SYSTEM_NAV: NavItem[] = [
-  { id: "networks", label: "Networks", icon: "◈" },
-  { id: "host", label: "Host & interfaces", icon: "⌂" },
-  { id: "setup", label: "Setup & Status", icon: "⚙" },
+  { id: "networks", label: "Networks", icon: "networks" },
+  { id: "host", label: "Host & interfaces", icon: "host" },
+  { id: "setup", label: "Setup & Status", icon: "setup" },
 ];
 
 export function DesktopApp() {
@@ -96,8 +103,15 @@ export function DesktopApp() {
   const [portProfile, setPortProfile] = useState<PortProfile>("standard");
   const [extraRange, setExtraRange] = useState("");
   const [dataDir, setDataDir] = useState<string>();
+  /* Whether a model is connected. Read here rather than in the panel so the
+     nav can say so before the page is opened. */
+  const [assistantReady, setAssistantReady] = useState(false);
   const [appVersion, setAppVersion] = useState<string>();
   const [networks, setNetworks] = useState<NetworkProfile[]>([]);
+  /* Beside the networks because the two are only meaningful together: a group
+     header with no networks under it, or a network filed under a location that
+     is not in this list, is a list that renders wrong. */
+  const [locations, setLocations] = useState<Location[]>([]);
   const [activeNetwork, setActiveNetwork] = useState<string>();
   const [detection, setDetection] = useState<Detection | null>(null);
   const [scanTargets, setScanTargets] = useState<ScanTarget[] | null>(null);
@@ -195,17 +209,29 @@ export function DesktopApp() {
     }
   }, []);
 
+  /* Read at launch and again whenever the settings card saves — otherwise
+   * connecting a model leaves the Assistant page insisting there is none until
+   * the app is relaunched. */
+  const refreshAssistant = useCallback(async () => {
+    const assist = await api.getAssistConfig().catch(() => null);
+    if (!mounted.current) return;
+    // A cloud model without a key is configured but unusable, and saying so
+    // on the Assistant page beats failing at the first request.
+    setAssistantReady(!!assist?.enabled && (assist.provider !== "anthropic" || assist.hasKey));
+  }, []);
+
   const refreshNetworks = useCallback(async (): Promise<NetworkList> => {
     try {
       const list = await api.listNetworks();
       if (mounted.current) {
         setNetworks(list.networks);
+        setLocations(list.locations);
         setActiveNetwork(list.active);
       }
       return list;
     } catch {
       // Not fatal: the app still works against whichever network is selected.
-      return { networks: [] };
+      return { networks: [], locations: [] };
     }
   }, []);
 
@@ -289,6 +315,9 @@ export function DesktopApp() {
       setDataDir(dir);
       setAppVersion(version);
 
+      await refreshAssistant();
+      if (!mounted.current) return;
+
       const list = await refreshNetworks();
       if (!mounted.current) return;
       syncScanRange(list.networks, list.active);
@@ -320,7 +349,7 @@ export function DesktopApp() {
     return () => {
       mounted.current = false;
     };
-  }, [reloadSnapshot, refreshDoctor, refreshNetworks, syncScanRange]);
+  }, [reloadSnapshot, refreshDoctor, refreshNetworks, refreshAssistant, syncScanRange]);
 
   // Re-read after every scan and on every switch: the evidence comes from the
   // selected network's newest snapshot, so both change the answer.
@@ -548,10 +577,21 @@ export function DesktopApp() {
           fontWeight: active ? 600 : 400,
         }}
       >
-        <span aria-hidden style={{ color: active ? "var(--series-1)" : "var(--text-muted)" }}>
-          {item.icon}
+        <span
+          aria-hidden
+          style={{ color: active ? "var(--series-1)" : "var(--text-muted)", display: "inline-flex" }}
+        >
+          <Icon name={item.icon} size={15} />
         </span>
         <span className="min-w-0 flex-1 truncate">{item.label}</span>
+        {item.tag && (
+          <span
+            className="shrink-0 rounded-full border px-1.5 text-[9px] leading-[1.6] font-medium"
+            style={{ borderColor: "var(--border)", color: "var(--text-muted)" }}
+          >
+            {item.tag}
+          </span>
+        )}
         {badge && (
           <span
             aria-label={`${badgeCount} item(s) need attention`}
@@ -598,6 +638,7 @@ export function DesktopApp() {
       {detection && !discovery && (
         <NetworkPrompt
           detection={detection}
+          locations={locations}
           onResolved={async () => {
             setDetection(null);
             setSnapshot(null);
@@ -628,6 +669,7 @@ export function DesktopApp() {
 
         <NetworkSwitcher
           networks={networks}
+          locations={locations}
           activeId={activeNetwork}
           onSwitch={changeNetwork}
           onManage={() => setSection("networks")}
@@ -774,12 +816,14 @@ export function DesktopApp() {
               loading={doctorLoading}
               dataDir={dataDir}
               appVersion={appVersion}
+              onAssistantChanged={refreshAssistant}
             />
           ) : section === "networks" ? (
             /* Handled before the no-snapshot case: managing networks must work
                even when the selected one has never been scanned. */
             <NetworksPanel
               networks={networks}
+              locations={locations}
               activeId={activeNetwork}
               adjacent={adjacent}
               onReloadAdjacent={refreshAdjacent}
@@ -820,6 +864,18 @@ export function DesktopApp() {
                 onChanged={() => refreshDoctor(true)}
               />
             </div>
+          ) : section === "assistant" ? (
+            /* Before the no-snapshot gate: the assistant can measure live and
+               will say for itself when it needs a scan to work from. Keyed by
+               network so a switch loads that network's cases rather than
+               leaving the previous one's on screen. */
+            <AssistantPanel
+              key={activeNetwork ?? "none"}
+              networkId={activeNetwork}
+              networkName={activeProfile?.name}
+              configured={assistantReady}
+              onOpenSetup={() => setSection("setup")}
+            />
           ) : contentLoading ? (
             <Card>
               <LoadingState
@@ -914,9 +970,10 @@ export function DesktopApp() {
                     : blocked
                       ? "var(--status-critical)"
                       : "var(--status-good)",
+                  display: "inline-flex",
                 }}
               >
-                ●
+                <Icon name="dot" size={10} />
               </span>
               <span style={{ color: "var(--text-secondary)" }}>
                 {running
@@ -1134,7 +1191,7 @@ function ScanDock({
                       : phase.status === "error"
                         ? "error"
                         : phase.status === "done"
-                          ? "✓"
+                          ? <Icon name="check" size={12} />
                           : phase.status === "running" && phase.progress
                             ? `${phase.progress.current}/${phase.progress.total}`
                             : ""}
@@ -1360,10 +1417,10 @@ function Overview({
                             : tile.tone === "serious"
                               ? "var(--status-serious)"
                               : "var(--status-critical)",
-                      fontSize: "0.7em",
+                      display: "inline-flex",
                     }}
                   >
-                    ●
+                    <Icon name="dot" size={9} />
                   </span>
                 )}
                 {tile.detail}
@@ -1378,9 +1435,7 @@ function Overview({
           <ul className="space-y-1.5">
             {snapshot.warnings.map((warning, i) => (
               <li key={i} className="flex items-start gap-2 text-sm">
-                <span aria-hidden style={{ color: "var(--status-warning)" }}>
-                  ▲
-                </span>
+                <StatusMark tone="warning" className="mt-1" />
                 <span style={{ color: "var(--text-secondary)" }}>{warning}</span>
               </li>
             ))}

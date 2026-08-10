@@ -2,7 +2,7 @@
 
 import { Fragment, useMemo, useState } from "react";
 import { DeviceDetail } from "./DeviceDetail";
-import { DEVICE_TYPE_META, DeviceTypeBadge, EmptyState, Pill, StatusBadge } from "./ui";
+import { DEVICE_TYPE_META, DeviceTypeBadge, EmptyState, Icon, Pill, StatusBadge } from "./ui";
 import { compareIp } from "@/lib/service-labels";
 import {
   isCertificateEntry,
@@ -290,7 +290,7 @@ function Th({
         style={{ color: active ? "var(--text-primary)" : "var(--text-secondary)" }}
       >
         {children}
-        {active && <span aria-hidden>{ascending ? "↑" : "↓"}</span>}
+        {active && <Icon name={ascending ? "arrowUp" : "arrowDown"} size={11} />}
       </button>
     </th>
   );

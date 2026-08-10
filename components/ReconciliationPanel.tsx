@@ -1,7 +1,7 @@
 "use client";
 
 import { Fragment } from "react";
-import { Card, EmptyState, LoadingState, Pill, StatusBadge } from "./ui";
+import { Card, EmptyState, Icon, LoadingState, Pill, StatusBadge, StatusMark } from "./ui";
 import type { Reconciliation, UnifiSnapshot } from "@/lib/types";
 
 function formatSpeed(mbps?: number): string {
@@ -130,6 +130,10 @@ export function ReconciliationPanel({
   const degradedLinks = reconciliation.degradedLinks ?? [];
   const unscannedNetworks = reconciliation.unscannedNetworks ?? [];
   const flappingClients = reconciliation.flappingClients ?? [];
+  const troubledPorts = reconciliation.troubledPorts ?? [];
+  const saturatedRadios = reconciliation.saturatedRadios ?? [];
+  const loadedDevices = reconciliation.loadedDevices ?? [];
+  const meshedAccessPoints = reconciliation.meshedAccessPoints ?? [];
   const alarms = unifi?.alarms ?? [];
   const clean =
     shadow.length === 0 &&
@@ -140,6 +144,9 @@ export function ReconciliationPanel({
     degradedLinks.length === 0 &&
     unscannedNetworks.length === 0 &&
     flappingClients.length === 0 &&
+    troubledPorts.length === 0 &&
+    saturatedRadios.length === 0 &&
+    loadedDevices.length === 0 &&
     alarms.length === 0;
 
   return (
@@ -154,9 +161,7 @@ export function ReconciliationPanel({
           <ul className="space-y-1.5">
             {alarms.map((alarm, i) => (
               <li key={i} className="flex items-start gap-2 text-sm">
-                <span aria-hidden style={{ color: "var(--status-critical)" }}>
-                  ▲
-                </span>
+                <StatusMark tone="critical" className="mt-1" />
                 <span style={{ color: "var(--text-secondary)" }}>
                   {alarm.message}
                   {alarm.time !== undefined && (
@@ -198,9 +203,10 @@ export function ReconciliationPanel({
                         tile.tone === "critical"
                           ? "var(--status-critical)"
                           : "var(--status-warning)",
+                      display: "inline-flex",
                     }}
                   >
-                    ●
+                    <Icon name="dot" size={9} />
                   </span>
                 )}
               </p>
@@ -320,9 +326,7 @@ export function ReconciliationPanel({
           <ul className="space-y-1.5">
             {identityConflicts.map((conflict, i) => (
               <li key={i} className="flex items-start gap-2 text-sm">
-                <span aria-hidden style={{ color: "var(--status-serious)" }}>
-                  ▲
-                </span>
+                <StatusMark tone="serious" className="mt-1" />
                 <span style={{ color: "var(--text-secondary)" }}>{conflict}</span>
               </li>
             ))}
@@ -425,6 +429,132 @@ export function ReconciliationPanel({
                 </div>
                 <p className="mt-2 text-sm" style={{ color: "var(--text-secondary)" }}>
                   {flap.explanation}
+                </p>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
+
+      {/* Separate from "degraded links", which is about negotiated speed. These
+          are the faults a healthy link speed hides — and the usual answer to
+          "the link says gigabit but the transfer crawls". */}
+      {troubledPorts.length > 0 && (
+        <Card
+          title={`Port faults — ${troubledPorts.length}`}
+          subtitle="Links that are up and fast on paper, and faulty in practice"
+        >
+          <ul className="space-y-2">
+            {troubledPorts.map((port) => (
+              <li
+                key={`${port.switchName}-${port.port}`}
+                className="rounded-lg border p-3"
+                style={{ borderColor: "var(--border)" }}
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium">{port.switchName}</span>
+                  <Pill mono>
+                    port {port.port}
+                    {port.portName ? ` · ${port.portName}` : ""}
+                  </Pill>
+                  <Pill mono>{port.speedMbps} Mbps</Pill>
+                  {port.halfDuplex && <StatusBadge tone="critical" label="Half duplex" />}
+                  {port.stpBlocking && <StatusBadge tone="warning" label="STP blocking" />}
+                  {port.errors > 0 && (
+                    <StatusBadge tone="serious" label={`${port.errors.toLocaleString()} errors`} />
+                  )}
+                  {port.drops > 0 && (
+                    <StatusBadge tone="warning" label={`${port.drops.toLocaleString()} drops`} />
+                  )}
+                </div>
+                <p className="mt-2 text-sm" style={{ color: "var(--text-secondary)" }}>
+                  {port.halfDuplex
+                    ? "This link negotiated half duplex. Throughput collapses under traffic in both directions at once while a ping still looks healthy — usually a forced speed/duplex setting at one end, or a failing cable."
+                    : port.stpBlocking
+                      ? "Spanning tree has blocked this port, which means it found a loop. The port carries no traffic until the loop is removed."
+                      : "Frames on this link are being discarded. On a gigabit link that almost always means a damaged pair or a marginal connector — errors rise with traffic while the link stays up."}
+                </p>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
+
+      {saturatedRadios.length > 0 && (
+        <Card
+          title={`Saturated radios — ${saturatedRadios.length}`}
+          subtitle="Airtime is shared, so a busy channel slows every client on it"
+        >
+          <ul className="space-y-2">
+            {saturatedRadios.map((radio, i) => (
+              <li key={i} className="rounded-lg border p-3" style={{ borderColor: "var(--border)" }}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium">{radio.accessPoint}</span>
+                  <Pill>{radio.band}</Pill>
+                  <StatusBadge
+                    tone={radio.utilisationPercent >= 90 ? "critical" : "serious"}
+                    label={`${radio.utilisationPercent.toFixed(0)}% airtime`}
+                  />
+                  <Pill>{radio.clients} client(s)</Pill>
+                </div>
+                <p className="mt-2 text-sm" style={{ color: "var(--text-secondary)" }}>
+                  {radio.interferencePercent !== undefined && radio.interferencePercent > 40
+                    ? `${radio.interferencePercent.toFixed(0)}% of that airtime is not this network's traffic — a neighbouring network or non-Wi-Fi interference is using the channel. Moving to a quieter one helps more than anything done to the clients.`
+                    : "Most of this airtime is this network's own traffic. The band is simply full: a slow client holds the channel while it transmits, so everyone else waits."}
+                </p>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
+
+      {loadedDevices.length > 0 && (
+        <Card
+          title={`Devices under load — ${loadedDevices.length}`}
+          subtitle="Infrastructure at its limit adds delay to everything it forwards"
+        >
+          <ul className="space-y-2">
+            {loadedDevices.map((device, i) => (
+              <li key={i} className="rounded-lg border p-3" style={{ borderColor: "var(--border)" }}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium">{device.device}</span>
+                  <Pill>{device.role}</Pill>
+                  <StatusBadge
+                    tone={device.cpuPercent >= 95 ? "critical" : "serious"}
+                    label={`${device.cpuPercent.toFixed(0)}% CPU`}
+                  />
+                  {device.memPercent !== undefined && (
+                    <Pill>{device.memPercent.toFixed(0)}% memory</Pill>
+                  )}
+                </div>
+                <p className="mt-2 text-sm" style={{ color: "var(--text-secondary)" }}>
+                  Sustained load here affects every flow this device handles. On a gateway that
+                  includes traffic routed between VLANs, which is why a transfer between two local
+                  machines on different networks can stall the whole site.
+                </p>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
+
+      {meshedAccessPoints.length > 0 && (
+        <Card
+          title={`Wireless backhaul — ${meshedAccessPoints.length}`}
+          subtitle="Context rather than a fault: these access points have no cable"
+        >
+          <ul className="space-y-2">
+            {meshedAccessPoints.map((ap, i) => (
+              <li key={i} className="rounded-lg border p-3" style={{ borderColor: "var(--border)" }}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium">{ap.accessPoint}</span>
+                  {ap.speedMbps !== undefined && <Pill mono>{ap.speedMbps} Mbps uplink</Pill>}
+                  {ap.rssi !== undefined && <Pill mono>RSSI {ap.rssi}</Pill>}
+                </div>
+                <p className="mt-2 text-sm" style={{ color: "var(--text-secondary)" }}>
+                  Every client on this access point shares its wireless uplink, and that uplink
+                  competes for the same airtime as they do. A transfer through it is capped by the
+                  weaker of the two hops, whatever the clients&apos; own signal strength suggests.
                 </p>
               </li>
             ))}

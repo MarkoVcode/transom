@@ -13,15 +13,49 @@ use crate::types::{
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 
-/// Interface name prefixes that are never worth scanning.
+/// Unix device names: lowercase, and the kind of device is the prefix.
+const VIRTUAL_PREFIXES: &[&str] = &[
+    "docker", "br-", "virbr", "veth", "tun", "tap", "vboxnet", "vmnet", "utun", "awdl", "llw",
+    "bridge", "zt", "wg",
+];
+
+/// Windows has no device-name convention — `if_addrs` reports the adapter's
+/// user-facing friendly name ("vEthernet (WSL)", "VirtualBox Host-Only
+/// Network", "Local Area Connection* 1"). None of those start with a Unix
+/// prefix, so before this list every Hyper-V, WSL, VM and VPN adapter counted
+/// as scannable and its subnet was swept as if it were a real LAN.
+///
+/// Matched anywhere in the name and case-insensitively, since neither the
+/// position nor the capitalisation is ours to predict.
+const VIRTUAL_MARKERS: &[&str] = &[
+    "vethernet",
+    "hyper-v",
+    "virtualbox",
+    "vmware",
+    "virtual adapter",
+    "wi-fi direct",
+    // Microsoft's own naming for the Wi-Fi Direct / hosted-network adapters.
+    // The `*` is what separates them from a real NIC called "Local Area
+    // Connection" on older Windows.
+    "local area connection*",
+    "bluetooth network",
+    "tap-windows",
+    "openvpn",
+    "wintun",
+    "wireguard",
+    "tailscale",
+    "zerotier",
+    "npcap",
+];
+
+/// Interfaces that are never worth scanning — virtual switches, container
+/// bridges and tunnels. Their subnets are not this machine's LAN.
 pub fn is_virtual_interface(name: &str) -> bool {
-    const VIRTUAL_PREFIXES: &[&str] = &[
-        "docker", "br-", "virbr", "veth", "tun", "tap", "vboxnet", "vmnet", "utun", "awdl", "llw",
-        "bridge", "zt", "wg",
-    ];
+    let lower = name.to_ascii_lowercase();
     VIRTUAL_PREFIXES
         .iter()
-        .any(|prefix| name.starts_with(prefix))
+        .any(|prefix| lower.starts_with(prefix))
+        || VIRTUAL_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
 fn mask_to_prefix(mask: Ipv4Addr) -> u8 {
@@ -200,9 +234,9 @@ fn classify(interfaces: &mut [InterfaceInfo], gateway_dev: &str, warnings: &mut 
         }
         if is_virtual_interface(&iface.name) {
             iface.scannable = false;
-            iface.skip_reason = Some("virtual/container bridge".into());
+            iface.skip_reason = Some("virtual or tunnel adapter".into());
             warnings.push(format!(
-                "Skipping {} (virtual/container bridge)",
+                "Skipping {} (virtual or tunnel adapter)",
                 iface.name
             ));
             continue;
@@ -393,6 +427,33 @@ mod tests {
             "a /16 docker bridge would be 65k hosts"
         );
         assert!(warnings.iter().any(|w| w.contains("docker0")));
+    }
+
+    #[test]
+    fn excludes_windows_virtual_adapters_by_their_friendly_names() {
+        // These arrive from `if_addrs` exactly as Windows presents them, so the
+        // Unix prefix list never matched any of them and their subnets were
+        // swept as if they were the LAN.
+        for name in [
+            "vEthernet (Default Switch)",
+            "vEthernet (WSL (Hyper-V firewall))",
+            "VirtualBox Host-Only Network",
+            "VMware Network Adapter VMnet8",
+            "Local Area Connection* 1",
+            "Microsoft Wi-Fi Direct Virtual Adapter",
+            "Bluetooth Network Connection",
+            "OpenVPN TAP-Windows6",
+            "Tailscale",
+        ] {
+            assert!(
+                is_virtual_interface(name),
+                "{name} is a virtual adapter, not a LAN"
+            );
+        }
+
+        for name in ["Ethernet", "Ethernet 2", "Wi-Fi", "eth0", "wlo1", "enp3s0"] {
+            assert!(!is_virtual_interface(name), "{name} is a real link");
+        }
     }
 
     #[test]

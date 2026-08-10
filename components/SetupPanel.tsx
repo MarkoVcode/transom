@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Button, Card, StatusBadge, type StatusTone } from "./ui";
+import { AssistantSettings } from "./AssistantSettings";
+import { Button, Card, Icon, StatusBadge, StatusMark, type StatusTone } from "./ui";
 import * as api from "@/lib/api";
 import type { CapabilityReport, CapabilityStatus, DoctorReport, Tier } from "@/lib/types";
 
@@ -43,12 +44,15 @@ export function SetupPanel({
   loading,
   dataDir,
   appVersion,
+  onAssistantChanged,
 }: {
   report: DoctorReport | null;
   onRecheck: () => void;
   loading: boolean;
   dataDir?: string;
   appVersion?: string;
+  /** Connecting or disconnecting a model changes what the Assistant page offers. */
+  onAssistantChanged?: () => void;
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [elevated, setElevated] = useState(false);
@@ -87,9 +91,7 @@ export function SetupPanel({
           }}
         >
           <div className="flex items-start gap-3">
-            <span aria-hidden className="text-lg" style={{ color: "var(--status-critical)" }}>
-              ■
-            </span>
+            <StatusMark tone="critical" size={16} className="mt-0.5" />
             <div className="min-w-0">
               <h2 className="text-sm font-semibold" style={{ color: "var(--status-critical)" }}>
                 The app cannot run a scan on this machine
@@ -204,6 +206,10 @@ export function SetupPanel({
           </p>
         )}
       </Card>
+
+      {/* System scope, like the rest of this page: the model is a property of
+          this machine, not of whichever network happens to be selected. */}
+      <AssistantSettings onChanged={onAssistantChanged} />
 
       <DangerZone />
     </div>
@@ -357,8 +363,8 @@ function CapabilityRow({
             tone={STATUS_TONE[capability.status]}
             label={STATUS_LABEL[capability.status]}
           />
-          <span aria-hidden style={{ color: "var(--text-muted)" }}>
-            {open ? "▾" : "▸"}
+          <span aria-hidden style={{ color: "var(--text-muted)", display: "inline-flex" }}>
+            <Icon name={open ? "chevronDown" : "chevronRight"} size={13} />
           </span>
         </span>
       </button>
@@ -444,12 +450,7 @@ export function CapabilityBanner({
       }}
     >
       <div className="flex min-w-0 items-start gap-3">
-        <span
-          aria-hidden
-          style={{ color: critical ? "var(--status-critical)" : "var(--status-warning)" }}
-        >
-          {critical ? "■" : "▲"}
-        </span>
+        <StatusMark tone={critical ? "critical" : "warning"} className="mt-1" />
         <div className="min-w-0">
           <p className="text-sm font-medium">
             {critical

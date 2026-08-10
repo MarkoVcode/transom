@@ -5,7 +5,7 @@
 //! reach but the controller has never issued a lease to is interesting precisely
 //! because the two views conflict; neither tool can produce that category alone.
 
-use super::model::UnifiSnapshot;
+use super::model::{self, UnifiSnapshot};
 use crate::types::{Device, DeviceType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -163,6 +163,23 @@ pub struct Reconciliation {
     /// Clients the controller's event log shows repeatedly disconnecting.
     #[serde(default)]
     pub flapping_clients: Vec<FlappingClient>,
+    /// Live ports that are half duplex, carrying errors, or blocked by spanning
+    /// tree. Distinct from `degraded_links`, which is about negotiated *speed*:
+    /// these are the faults a healthy-looking link speed hides.
+    #[serde(default)]
+    pub troubled_ports: Vec<model::TroubledPort>,
+    /// Radios whose airtime is close to spent — a whole-cell cause, not a
+    /// per-client one.
+    #[serde(default)]
+    pub saturated_radios: Vec<model::SaturatedRadio>,
+    /// Managed devices under sustained CPU load. A gateway at its limit is what
+    /// "the whole network freezes" usually means.
+    #[serde(default)]
+    pub loaded_devices: Vec<model::LoadedDevice>,
+    /// Access points reaching the network over a wireless backhaul, whose
+    /// quality caps every client behind them.
+    #[serde(default)]
+    pub meshed_access_points: Vec<model::MeshedAccessPoint>,
     pub summary: String,
 }
 
@@ -488,6 +505,15 @@ pub fn apply(
         })
         .collect();
 
+    // Thresholds are deliberately conservative: these feed a diagnosis, and a
+    // finding that fires on a healthy network teaches the reader to ignore it.
+    // 80% airtime is where a channel stops absorbing bursts; 85% sustained CPU
+    // is where a gateway starts adding latency to what it forwards.
+    let troubled_ports = unifi.troubled_ports();
+    let saturated_radios = unifi.saturated_radios(80.0);
+    let loaded_devices = unifi.loaded_devices(85.0);
+    let meshed_access_points = unifi.meshed_access_points();
+
     let mut reconciliation = Reconciliation {
         matched,
         shadow,
@@ -498,6 +524,10 @@ pub fn apply(
         degraded_links,
         unscanned_networks,
         flapping_clients,
+        troubled_ports,
+        saturated_radios,
+        loaded_devices,
+        meshed_access_points,
         summary: String::new(),
     };
     reconciliation.summary = reconciliation.build_summary();
@@ -685,6 +715,9 @@ impl Reconciliation {
             && self.degraded_links.is_empty()
             && self.unscanned_networks.is_empty()
             && self.flapping_clients.is_empty()
+            && self.troubled_ports.is_empty()
+            && self.saturated_radios.is_empty()
+            && self.loaded_devices.is_empty()
         {
             return format!("All {matched} devices are accounted for by the controller.");
         }
@@ -723,6 +756,23 @@ impl Reconciliation {
                 self.flapping_clients.len()
             ));
         }
+        if !self.troubled_ports.is_empty() {
+            parts.push(format!("{} port(s) with faults", self.troubled_ports.len()));
+        }
+        if !self.saturated_radios.is_empty() {
+            parts.push(format!(
+                "{} radio(s) saturated",
+                self.saturated_radios.len()
+            ));
+        }
+        if !self.loaded_devices.is_empty() {
+            parts.push(format!(
+                "{} device(s) under load",
+                self.loaded_devices.len()
+            ));
+        }
+        // Mesh uplinks are context rather than a fault, so they inform a
+        // diagnosis without being counted as something wrong.
         parts.join(", ")
     }
 }
@@ -732,6 +782,22 @@ mod tests {
     use super::*;
     use crate::types::PortInfo;
     use crate::unifi::model::{UnifiClientRecord, UnifiDeviceRecord};
+
+    #[test]
+    fn reconciliations_stored_before_the_new_findings_still_load() {
+        // Every stored snapshot carries one of these. A required field here
+        // would make the whole history unreadable — the same trap as
+        // `restrictToSubnets` and `offScope`.
+        let old = r#"{"matched":12,"shadow":[],"missed":[],"hiddenSegments":[],
+                      "identityConflicts":[],"summary":"All 12 devices accounted for."}"#;
+        let reconciliation: Reconciliation = serde_json::from_str(old).unwrap();
+
+        assert_eq!(reconciliation.matched, 12);
+        assert!(reconciliation.troubled_ports.is_empty());
+        assert!(reconciliation.saturated_radios.is_empty());
+        assert!(reconciliation.loaded_devices.is_empty());
+        assert!(reconciliation.meshed_access_points.is_empty());
+    }
 
     fn device(ip: &str, mac: Option<&str>, name: &str, ports: &[u16]) -> Device {
         Device {

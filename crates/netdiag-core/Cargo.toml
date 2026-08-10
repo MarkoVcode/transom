@@ -28,5 +28,16 @@ sha2 = "0.10"
 # Real CA roots — used only for public HTTPS (the update check), never for LAN.
 webpki-roots = "0.26"
 
+# The neighbour cache is read through the IP Helper API rather than by parsing
+# `arp -a`, whose output is localised and omits entries the API returns.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    # MIB_IPNET_TABLE2 is gated behind Ndis, not IpHelper.
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
