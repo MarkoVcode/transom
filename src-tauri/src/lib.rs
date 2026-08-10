@@ -900,11 +900,7 @@ async fn list_networks(state: State<'_, Arc<AppState>>) -> Result<NetworkList, S
     let index = NetworkIndex::load(state.settings_root()).await;
 
     // Before the loop below, which consumes `index.networks`.
-    let locations: Vec<Location> = index
-        .locations_sorted()
-        .into_iter()
-        .cloned()
-        .collect();
+    let locations: Vec<Location> = index.locations_sorted().into_iter().cloned().collect();
 
     let mut networks = Vec::with_capacity(index.networks.len());
     for profile in index.networks {

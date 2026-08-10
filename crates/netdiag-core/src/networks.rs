@@ -398,7 +398,10 @@ impl NetworkIndex {
 
         if let Some(clash) = self.location_by_name(name) {
             if clash.id != id {
-                return Err(format!("A location called \"{}\" already exists", clash.name));
+                return Err(format!(
+                    "A location called \"{}\" already exists",
+                    clash.name
+                ));
             }
         }
 
@@ -897,7 +900,10 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(index.locations.len(), 1);
-        assert_eq!(index.locations[0].name, "Head office", "the first spelling wins");
+        assert_eq!(
+            index.locations[0].name, "Head office",
+            "the first spelling wins"
+        );
     }
 
     #[test]
@@ -933,7 +939,10 @@ mod tests {
         index.rename_location(&id, "Head office").unwrap();
 
         // Nothing stores the name, so one edit renames the group everywhere.
-        assert_eq!(index.get(&lan).unwrap().location_id.as_deref(), Some(id.as_str()));
+        assert_eq!(
+            index.get(&lan).unwrap().location_id.as_deref(),
+            Some(id.as_str())
+        );
         assert_eq!(index.location(&id).unwrap().name, "Head office");
     }
 
@@ -941,14 +950,23 @@ mod tests {
     fn deleting_a_location_keeps_the_networks_in_it() {
         let mut index = with_networks(&["LAN", "Guest", "Elsewhere"]);
         let id = index.add_location("Office").unwrap();
-        let ids: Vec<String> = index.networks.iter().take(2).map(|n| n.id.clone()).collect();
+        let ids: Vec<String> = index
+            .networks
+            .iter()
+            .take(2)
+            .map(|n| n.id.clone())
+            .collect();
         for network in &ids {
             index.assign_location(network, Some(&id)).unwrap();
         }
 
         assert_eq!(index.delete_location(&id).unwrap(), 2);
 
-        assert_eq!(index.networks.len(), 3, "a label must not delete what it labels");
+        assert_eq!(
+            index.networks.len(),
+            3,
+            "a label must not delete what it labels"
+        );
         assert!(index.networks.iter().all(|n| n.location_id.is_none()));
         assert!(index.location(&id).is_none());
     }

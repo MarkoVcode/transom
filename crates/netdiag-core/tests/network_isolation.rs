@@ -289,15 +289,18 @@ async fn locations_survive_a_save_and_load_round_trip() {
     let root = temp_root("locations-round-trip");
 
     let mut index = NetworkIndex::default();
-    index
-        .networks
-        .push(NetworkProfile::new("LAN", site("aa:aa:aa:aa:aa:aa", "Office")));
-    index
-        .networks
-        .push(NetworkProfile::new("Guest", site("aa:aa:aa:aa:aa:ab", "Office guest")));
-    index
-        .networks
-        .push(NetworkProfile::new("Home", site("bb:bb:bb:bb:bb:bb", "HomeWiFi")));
+    index.networks.push(NetworkProfile::new(
+        "LAN",
+        site("aa:aa:aa:aa:aa:aa", "Office"),
+    ));
+    index.networks.push(NetworkProfile::new(
+        "Guest",
+        site("aa:aa:aa:aa:aa:ab", "Office guest"),
+    ));
+    index.networks.push(NetworkProfile::new(
+        "Home",
+        site("bb:bb:bb:bb:bb:bb", "HomeWiFi"),
+    ));
 
     let office = index.add_location("Head office").unwrap();
     index.add_location("Attic").unwrap();
@@ -308,8 +311,14 @@ async fn locations_survive_a_save_and_load_round_trip() {
 
     let loaded = NetworkIndex::load(&root).await;
     assert_eq!(loaded.locations.len(), 2);
-    assert_eq!(loaded.get(&lan).unwrap().location_id.as_deref(), Some(office.as_str()));
-    assert_eq!(loaded.get(&guest).unwrap().location_id.as_deref(), Some(office.as_str()));
+    assert_eq!(
+        loaded.get(&lan).unwrap().location_id.as_deref(),
+        Some(office.as_str())
+    );
+    assert_eq!(
+        loaded.get(&guest).unwrap().location_id.as_deref(),
+        Some(office.as_str())
+    );
     assert!(loaded.networks[2].location_id.is_none());
 
     // The one ordering rule, applied to what actually came off disk.
@@ -328,9 +337,10 @@ async fn a_location_id_pointing_at_a_deleted_location_self_heals_on_load() {
     let root = temp_root("locations-heal");
 
     let mut index = NetworkIndex::default();
-    index
-        .networks
-        .push(NetworkProfile::new("LAN", site("aa:aa:aa:aa:aa:aa", "Office")));
+    index.networks.push(NetworkProfile::new(
+        "LAN",
+        site("aa:aa:aa:aa:aa:aa", "Office"),
+    ));
     let office = index.add_location("Head office").unwrap();
     let lan = index.networks[0].id.clone();
     index.assign_location(&lan, Some(&office)).unwrap();
@@ -357,12 +367,14 @@ async fn deleting_a_location_never_deletes_a_networks_history() {
     let root = temp_root("locations-delete");
 
     let mut index = NetworkIndex::default();
-    index
-        .networks
-        .push(NetworkProfile::new("LAN", site("aa:aa:aa:aa:aa:aa", "Office")));
-    index
-        .networks
-        .push(NetworkProfile::new("Guest", site("aa:aa:aa:aa:aa:ab", "Office guest")));
+    index.networks.push(NetworkProfile::new(
+        "LAN",
+        site("aa:aa:aa:aa:aa:aa", "Office"),
+    ));
+    index.networks.push(NetworkProfile::new(
+        "Guest",
+        site("aa:aa:aa:aa:aa:ab", "Office guest"),
+    ));
     let office = index.add_location("Head office").unwrap();
     let (lan, guest) = (index.networks[0].id.clone(), index.networks[1].id.clone());
     index.assign_location(&lan, Some(&office)).unwrap();
