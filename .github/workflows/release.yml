@@ -49,7 +49,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               tag_name: version,
-              name: `Local Network Diagnostics ${version}`,
+              name: `Transom ${version}`,
               body: [
                 '## Downloads',
                 '',
@@ -64,7 +64,7 @@ jobs:
                 '',
                 'These binaries are **not code-signed**. On first launch:',
                 '',
-                '- **macOS** — Gatekeeper will refuse to open it. Right-click the app and choose *Open*, or run `xattr -dr com.apple.quarantine "/Applications/Local Network Diagnostics.app"`.',
+                '- **macOS** — Gatekeeper will refuse to open it. Right-click the app and choose *Open*, or run `xattr -dr com.apple.quarantine "/Applications/Transom.app"`.',
                 '- **Windows** — SmartScreen shows "Windows protected your PC". Click *More info* → *Run anyway*.',
                 '',
                 '### Requirements',

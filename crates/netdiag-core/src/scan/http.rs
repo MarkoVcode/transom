@@ -84,7 +84,7 @@ pub fn tls_config() -> Arc<ClientConfig> {
 
 fn build_request(host: &str, path: &str) -> String {
     format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: local-network-diag/1.0\r\nAccept: text/html,*/*\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: transom/1.0\r\nAccept: text/html,*/*\r\nConnection: close\r\n\r\n"
     )
 }
 
@@ -320,7 +320,7 @@ pub async fn get_text_public(
             // GitHub rejects requests without a User-Agent.
             let mut request = format!(
                 "GET {request_path} HTTP/1.1\r\nHost: {host_for_sni}\r\n\
-                 User-Agent: local-network-diag\r\nConnection: close\r\n"
+                 User-Agent: transom\r\nConnection: close\r\n"
             );
             for (key, value) in headers {
                 request.push_str(&format!("{key}: {value}\r\n"));

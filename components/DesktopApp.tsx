@@ -116,6 +116,10 @@ export function DesktopApp() {
   const [detection, setDetection] = useState<Detection | null>(null);
   const [scanTargets, setScanTargets] = useState<ScanTarget[] | null>(null);
   const [discovery, setDiscovery] = useState<DiscoveredNetwork[] | null>(null);
+  /* The picker doubles as the first thing a new user ever sees, so it carries
+     the introduction — but only when it opened by itself with nothing saved,
+     never when reopened deliberately from the Networks page. */
+  const [discoveryIntro, setDiscoveryIntro] = useState(false);
   /* `snapshot === null` cannot distinguish "nothing scanned yet" from "not read
    * yet", and rendering the empty state during a load is what made the app look
    * like it had lost a network's history until the user navigated away and
@@ -327,7 +331,10 @@ export function DesktopApp() {
         // can see instead of the single-network detection prompt.
         try {
           const found = await api.discoverLocalNetworks();
-          if (mounted.current) setDiscovery(found);
+          if (mounted.current) {
+            setDiscoveryIntro(true);
+            setDiscovery(found);
+          }
         } catch {
           // Discovery is best-effort; the Networks page can still create one.
         }
@@ -620,18 +627,23 @@ export function DesktopApp() {
       {discovery && (
         <NetworkDiscovery
           candidates={discovery}
+          introduce={discoveryIntro}
           onDone={async () => {
             // Reopenable from the Networks page, where a snapshot is already on
             // screen — and adopting a subnet here selects a different network,
             // so that snapshot is no longer this network's.
             setDiscovery(null);
+            setDiscoveryIntro(false);
             setSnapshot(null);
             const list = await refreshNetworks();
             syncScanRange(list.networks, list.active);
             await reloadSnapshot();
             setRefreshToken((token) => token + 1);
           }}
-          onSkip={() => setDiscovery(null)}
+          onSkip={() => {
+            setDiscovery(null);
+            setDiscoveryIntro(false);
+          }}
         />
       )}
 
@@ -658,8 +670,7 @@ export function DesktopApp() {
         style={{ borderColor: "var(--border)", background: "var(--surface-1)" }}
       >
         <div className="px-4 py-4">
-          <h1 className="text-sm font-semibold leading-tight">Local Network</h1>
-          <h1 className="text-sm font-semibold leading-tight">Diagnostics</h1>
+          <h1 className="text-sm font-semibold leading-tight">Transom</h1>
           {snapshot && (
             <p className="mt-1.5 font-mono text-[11px]" style={{ color: "var(--text-muted)" }}>
               {snapshot.host.hostname}
@@ -829,6 +840,7 @@ export function DesktopApp() {
               onReloadAdjacent={refreshAdjacent}
               onDiscover={async () => {
                 try {
+                  setDiscoveryIntro(false);
                   setDiscovery(await api.discoverLocalNetworks());
                 } catch (err) {
                   setError(String(err));

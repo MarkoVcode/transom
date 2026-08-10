@@ -1,5 +1,5 @@
 [package]
-name = "local-network-diag"
+name = "transom"
 description = "Cross-platform desktop app for local network discovery and diagnostics"
 authors = ["MarkoVcode and contributors"]
 version.workspace = true

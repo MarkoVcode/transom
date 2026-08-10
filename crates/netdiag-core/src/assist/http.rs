@@ -117,7 +117,7 @@ impl Target {
 
     fn build_request(&self, body: &str, headers: &[(&str, &str)]) -> String {
         let mut request = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: local-network-diag\r\n\
+            "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: transom\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
             self.path,
             self.host,

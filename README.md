@@ -1,15 +1,19 @@
-# Local Network Diagnostics
+# Transom
 
 [![CI](https://github.com/MarkoVcode/local-network-diag/actions/workflows/ci.yml/badge.svg)](https://github.com/MarkoVcode/local-network-diag/actions/workflows/ci.yml)
 [![Release](https://github.com/MarkoVcode/local-network-diag/actions/workflows/release.yml/badge.svg)](https://github.com/MarkoVcode/local-network-diag/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](https://github.com/MarkoVcode/local-network-diag/releases)
 
-A cross-platform desktop app that discovers every device on your local network,
-identifies it, measures connectivity and Wi-Fi health, and tracks what changes
-between scans. Optionally, it will read a UniFi controller for what a scan
-cannot see from outside a device, and — if you connect a model — investigate a
-symptom you describe in your own words.
+*Over the transom*: something that arrived unannounced, without introduction —
+from the small window above a door, which is what a transom is.
+
+That is how every device joins your network. **Transom** is the app that notices
+what came through. It discovers every device on your local network, identifies
+it, measures connectivity and Wi-Fi health, and tracks what changes between
+scans. Optionally, it will read a UniFi controller for what a scan cannot see
+from outside a device, and — if you connect a model — investigate a symptom you
+describe in your own words.
 
 Runs on **Windows, macOS and Linux**. Needs **no administrator privileges** and
 **no extra tools installed**.
@@ -31,7 +35,7 @@ Download the installer for your platform from the
 Releases are **not code-signed**, so on first launch:
 
 - **macOS** — Gatekeeper blocks it. Right-click the app → *Open*, or run
-  `xattr -dr com.apple.quarantine "/Applications/Local Network Diagnostics.app"`.
+  `xattr -dr com.apple.quarantine "/Applications/Transom.app"`.
 - **Windows** — SmartScreen shows "Windows protected your PC". Click
   *More info* → *Run anyway*.
 

@@ -344,7 +344,7 @@ impl UnifiClient {
             "{method} {path} HTTP/1.1\r\nHost: {}:{}\r\n",
             self.host, self.port
         );
-        request.push_str("User-Agent: local-network-diag/1.0\r\nAccept: application/json\r\n");
+        request.push_str("User-Agent: transom/1.0\r\nAccept: application/json\r\n");
         request.push_str("Connection: close\r\n");
 
         if let Some(cookie) = self.cookie_header() {

@@ -17,10 +17,14 @@ export function NetworkDiscovery({
   candidates,
   onDone,
   onSkip,
+  introduce = false,
 }: {
   candidates: DiscoveredNetwork[];
   onDone: () => void;
   onSkip: () => void;
+  /** Explain what the app is for. Only on a true first run — reopening this
+   *  from the Networks page is a routine action, not an introduction. */
+  introduce?: boolean;
 }) {
   // Untracked subnets start selected: the common case is "track what I have".
   const [selected, setSelected] = useState<Set<string>>(
@@ -79,11 +83,37 @@ export function NetworkDiscovery({
         style={{ borderColor: "var(--border-strong)", background: "var(--surface-1)" }}
       >
         <header className="border-b px-5 py-4" style={{ borderColor: "var(--border)" }}>
-          <h2 className="text-base font-semibold">Which networks should be tracked?</h2>
-          <p className="mt-1 text-sm" style={{ color: "var(--text-secondary)" }}>
-            These are the networks this machine can see right now. Each tracked network keeps
-            its own scan history and settings, and appears in the switcher at the top left.
-          </p>
+          {introduce ? (
+            <>
+              <h2 className="text-base font-semibold">Welcome to Transom</h2>
+              {/* Said once, on the first run. A tool whose name is a metaphor
+                  should explain the metaphor before it explains itself — and
+                  the idiom happens to be an exact description of the problem. */}
+              <p className="mt-1 text-sm" style={{ color: "var(--text-secondary)" }}>
+                A <strong>transom</strong> is the small window above a door. Something that
+                arrives <em>over the transom</em> came in unannounced — no introduction, no
+                explanation of itself.
+              </p>
+              <p className="mt-2 text-sm" style={{ color: "var(--text-secondary)" }}>
+                That is how everything joins a network. A phone, a doorbell, a television, a
+                neighbour&apos;s laptop — each one simply appears, and none of them says what it
+                is. This app goes and finds them, works out what each one actually is from the
+                evidence it can gather, and tells you when something changes.
+              </p>
+              <p className="mt-2 text-sm" style={{ color: "var(--text-secondary)" }}>
+                Start by choosing which networks to watch. Each one keeps its own history and
+                settings, so scanning at two places never mixes them up.
+              </p>
+            </>
+          ) : (
+            <>
+              <h2 className="text-base font-semibold">Which networks should be tracked?</h2>
+              <p className="mt-1 text-sm" style={{ color: "var(--text-secondary)" }}>
+                These are the networks this machine can see right now. Each tracked network keeps
+                its own scan history and settings, and appears in the switcher at the top left.
+              </p>
+            </>
+          )}
         </header>
 
         <div className="max-h-80 overflow-y-auto px-5 py-4">

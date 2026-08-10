@@ -1,7 +1,7 @@
 {
-  "name": "local-network-diag",
+  "name": "transom",
   "version": "1.6.0",
-  "description": "Cross-platform desktop app for local network discovery and diagnostics",
+  "description": "Transom — sees what arrived on your local network, identifies it, and explains what is wrong",
   "private": true,
   "license": "MIT",
   "author": "MarkoVcode",

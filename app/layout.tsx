@@ -4,7 +4,7 @@ import "./globals.css";
 // Deliberately no next/font: the palette specifies the system UI sans, and this
 // tool is meant to run on a LAN with no internet reachability.
 export const metadata: Metadata = {
-  title: "Local network diagnostics",
+  title: "Transom",
   description:
     "Repeatable discovery and health check of the local network — devices, services, connectivity and Wi-Fi.",
 };
