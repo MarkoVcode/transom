@@ -17,9 +17,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const RELEASES_API: &str =
-    "https://api.github.com/repos/MarkoVcode/local-network-diag/releases/latest";
-const RELEASES_PAGE: &str = "https://github.com/MarkoVcode/local-network-diag/releases/latest";
+const RELEASES_API: &str = "https://api.github.com/repos/MarkoVcode/transom/releases/latest";
+const RELEASES_PAGE: &str = "https://github.com/MarkoVcode/transom/releases/latest";
 
 /// How long a result is reused before asking GitHub again.
 const CACHE_TTL_HOURS: i64 = 6;

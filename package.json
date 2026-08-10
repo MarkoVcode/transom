@@ -7,12 +7,12 @@
   "author": "MarkoVcode",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/MarkoVcode/local-network-diag.git"
+    "url": "git+https://github.com/MarkoVcode/transom.git"
   },
   "bugs": {
-    "url": "https://github.com/MarkoVcode/local-network-diag/issues"
+    "url": "https://github.com/MarkoVcode/transom/issues"
   },
-  "homepage": "https://github.com/MarkoVcode/local-network-diag#readme",
+  "homepage": "https://github.com/MarkoVcode/transom#readme",
   "keywords": [
     "network",
     "scanner",

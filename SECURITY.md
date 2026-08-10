@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please report security issues privately through
-[GitHub Security Advisories](https://github.com/MarkoVcode/local-network-diag/security/advisories/new)
+[GitHub Security Advisories](https://github.com/MarkoVcode/transom/security/advisories/new)
 rather than opening a public issue.
 
 Include what you can reproduce, the platform you saw it on, and the impact you

@@ -1,9 +1,9 @@
 # Transom
 
-[![CI](https://github.com/MarkoVcode/local-network-diag/actions/workflows/ci.yml/badge.svg)](https://github.com/MarkoVcode/local-network-diag/actions/workflows/ci.yml)
-[![Release](https://github.com/MarkoVcode/local-network-diag/actions/workflows/release.yml/badge.svg)](https://github.com/MarkoVcode/local-network-diag/actions/workflows/release.yml)
+[![CI](https://github.com/MarkoVcode/transom/actions/workflows/ci.yml/badge.svg)](https://github.com/MarkoVcode/transom/actions/workflows/ci.yml)
+[![Release](https://github.com/MarkoVcode/transom/actions/workflows/release.yml/badge.svg)](https://github.com/MarkoVcode/transom/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](https://github.com/MarkoVcode/local-network-diag/releases)
+[![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](https://github.com/MarkoVcode/transom/releases)
 
 *Over the transom*: something that arrived unannounced, without introduction —
 from the small window above a door, which is what a transom is.
@@ -23,7 +23,7 @@ Runs on **Windows, macOS and Linux**. Needs **no administrator privileges** and
 ## Install
 
 Download the installer for your platform from the
-[Releases](https://github.com/MarkoVcode/local-network-diag/releases) page:
+[Releases](https://github.com/MarkoVcode/transom/releases) page:
 
 | Platform | File |
 | --- | --- |

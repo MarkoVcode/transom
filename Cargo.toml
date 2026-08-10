@@ -7,8 +7,8 @@ version = "1.6.0"
 edition = "2021"
 rust-version = "1.77"
 license = "MIT"
-repository = "https://github.com/MarkoVcode/local-network-diag"
-homepage = "https://github.com/MarkoVcode/local-network-diag"
+repository = "https://github.com/MarkoVcode/transom"
+homepage = "https://github.com/MarkoVcode/transom"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

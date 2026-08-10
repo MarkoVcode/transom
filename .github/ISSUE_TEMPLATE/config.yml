@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/MarkoVcode/local-network-diag/security/advisories/new
+    url: https://github.com/MarkoVcode/transom/security/advisories/new
     about: Please report security issues privately, not as a public issue.
   - name: Question or idea
-    url: https://github.com/MarkoVcode/local-network-diag/discussions
+    url: https://github.com/MarkoVcode/transom/discussions
     about: For usage questions and feature ideas.
