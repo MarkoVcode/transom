@@ -7,12 +7,12 @@
 
 A cross-platform desktop app that discovers every device on your local network,
 identifies it, measures connectivity and Wi-Fi health, and tracks what changes
-between scans.
+between scans. Optionally, it will read a UniFi controller for what a scan
+cannot see from outside a device, and — if you connect a model — investigate a
+symptom you describe in your own words.
 
 Runs on **Windows, macOS and Linux**. Needs **no administrator privileges** and
 **no extra tools installed**.
-
-![Devices](docs/screenshot-devices.png)
 
 ---
 
@@ -91,6 +91,29 @@ A network showing **Weak fingerprint** has only its subnet to go on — usually
 because the gateway's address had not been resolved when it was created. Select
 it while connected and use *Re-detect* to pick that up.
 
+### Locations
+
+One place often has several networks — a main LAN, a guest SSID, a lab VLAN —
+and as a flat list they read as unrelated. A **location** is a named place
+networks belong to. The switcher groups by it and names it without being opened;
+assign one when a new network is detected, or later under **Networks**.
+
+A location is a label and nothing more. It has no effect on how networks are
+identified, scanned or kept apart, and **deleting one keeps every network in it
+along with every scan they hold** — the networks simply move to *No location*.
+Locations are held by id rather than by name, so renaming one updates every
+network at once and two spellings cannot split a group. An installation that
+never creates one looks exactly as it did before.
+
+### Other networks seen from here
+
+Subnets this machine can demonstrably reach are offered under **Networks**, each
+with the evidence for it — a route the host holds, a subnet the controller
+declares, an address that answered, a router that answered a traceroute. Nothing
+is inferred from neighbouring addresses, and a prefix that was assumed rather
+than stated says so. A subnet this machine is *not* attached to can also be added
+by address range.
+
 ---
 
 ## UniFi controller (optional)
@@ -121,6 +144,32 @@ The point is not the union of the two. It is the small set of findings that exis
   switch port means an unmanaged switch, VM host or bridge is behind it, and an
   entire segment the controller cannot see into.
 
+### Infrastructure faults
+
+The controller also reports readings about its own hardware that its dashboard
+does not surface as problems:
+
+- **Port faults** — a link that is up and negotiated at gigabit but running
+  **half duplex**, one accumulating error or drop counters, or one blocked by
+  spanning tree because a loop was detected. This is separate from a *degraded
+  link*, which is about negotiated speed.
+- **Saturated radios** — airtime at or above 80%, split into your own traffic
+  and a neighbour's interference where both figures are reported. The remedy
+  differs completely: your own traffic means move clients or add capacity, a
+  neighbour's means change channel.
+- **Devices under load** — managed hardware pinned at high sustained CPU. "The
+  whole network freezes under load" is very often a saturated gateway rather
+  than anything on the LAN.
+- **Wireless backhaul** — access points meshed with no cable, whose uplink caps
+  every client behind them. Reported as context, deliberately not counted as a
+  fault.
+
+**Check diagnostic fields** (under the controller settings) asks the controller
+which of these it actually reports, and lists any diagnostic that cannot run
+with the exact fields missing. Controller releases differ in what they expose,
+and silence from a diagnostic that never had its evidence is not a clean bill of
+health.
+
 ### Connecting one
 
 1. In the UniFi console, create a **local** user with the **Viewer** role.
@@ -142,8 +191,58 @@ it.
 Debugging without the GUI:
 
 ```bash
-UNIFI_PASSWORD=… cargo run -p netdiag-core --bin netdiag-cli -- unifi 10.0.3.12 viewer
+UNIFI_PASSWORD=… cargo run -p netdiag-core --bin netdiag-cli -- unifi <controller-ip> viewer
 ```
+
+---
+
+## Troubleshooting assistant (optional, in development)
+
+Describe a symptom the way you would to a colleague — *"when I upload a large
+file to the NAS the whole network freezes"* — and the assistant investigates and
+proposes a fix, citing the readings it rests on.
+
+**The model never measures anything.** It decides what to check and explains
+what the readings mean; every number comes from this app's own probes. A finding
+or remedy that cites no evidence, or cites evidence that was never gathered, is
+**rejected rather than shown**.
+
+- **Read-only.** Its twelve tools query scan results and run live probes —
+  ping, traceroute, port scan, Wi-Fi survey. None of them can change your
+  network, and the live ones refuse targets outside private address ranges.
+- **Reproduce it while I watch.** For faults that only appear under load, it
+  takes a controller reading, waits while you reproduce the problem, then
+  reports **only the counters that moved** — port errors, byte counters, radio
+  airtime, CPU, Wi-Fi retries — against noise floors, so ordinary traffic does
+  not read as a finding.
+- **It asks, and it waits.** When it needs something only you know it stops and
+  asks. A case is stored per network, so the answer can come minutes later or
+  after restarting the app.
+- **Bounded.** Steps, output tokens and wall-clock time are all capped, and each
+  limit ends the case with a reason rather than silently. There is a Stop
+  button.
+
+### Privacy
+
+Identifiers are replaced **before anything is sent** and restored in the reply:
+MACs, hostnames, Wi-Fi names and your public IP become stable placeholders
+(`device-3`, `host-7`, `wifi-1`). Vendors, models, port numbers, speeds, signal
+levels and error counts pass through — they carry the diagnosis and identify
+nobody. Private addresses pass through deliberately, since the topology is the
+subject. This is on by default and can be turned off.
+
+### Connecting a model
+
+**Setup & Status → Troubleshooting assistant.** Off until you connect one.
+
+| | Where it runs | Notes |
+| --- | --- | --- |
+| **Anthropic** | Cloud | Best reasoning. Key stored in the OS keychain, never in a settings file, and never returned to the interface. |
+| **Ollama** | This machine | Nothing leaves the machine, at the cost of a weaker diagnosis — local models handle multi-step tool use less reliably. |
+
+Marked **in development**: the investigation loop and its safeguards are
+complete and tested, but the feature is new and the quality of a diagnosis
+depends heavily on the model behind it.
 
 ---
 
@@ -188,8 +287,6 @@ binary being present says very little:
 
 Each check therefore *performs* the operation and reports what really happened.
 
-![Setup and Status](docs/screenshot-setup.png)
-
 ---
 
 ## How it works without privileges
@@ -224,7 +321,7 @@ live behind a small platform layer:
 
 | | Linux | macOS | Windows |
 | --- | --- | --- | --- |
-| ARP table | `ip neigh` | `arp -an` | `arp -a` |
+| ARP table | `ip neigh` | `arp -an` | IP Helper API (`arp -a` fallback) |
 | Routes | `ip route` | `route` / `netstat` | `route print` |
 | Resolvers | `resolvectl` | `scutil --dns` | `Get-DnsClientServerAddress` |
 | Wi-Fi | `nmcli` | `system_profiler` | `netsh wlan` |
@@ -232,6 +329,15 @@ live behind a small platform layer:
 Platform differences that bite are covered by tests — for example BSD `ping`
 takes `-W` in **milliseconds** where Linux takes **seconds**, and Windows `ping`
 exits 0 even when every reply is "Destination host unreachable".
+
+On Windows the neighbour cache is read through the **IP Helper API** rather than
+by parsing `arp -a`, whose output is localised — so it returned nothing on
+non-English installations — and which prints only part of the cache. The
+hardware address is what yields the vendor, and the vendor is frequently the
+only clue what a device is, so this materially changes what gets identified
+there. Virtual adapters are matched by their Windows *friendly* names, so
+Hyper-V, WSL, VirtualBox, VMware, VPN and tunnel interfaces are no longer taken
+for the real network and swept as if they were.
 
 ### Off-subnet discovery
 
@@ -270,6 +376,10 @@ crates/netdiag-core/     Engine. No GUI dependency at all.
   src/scan/              mdns, ssdp, netbios, ports, sweep, banners,
                          connectivity, correlate, dns, http, hostinfo, wifi
   src/platform/          linux.rs · macos.rs · windows.rs
+  src/unifi/             Controller client, model, correlation and findings
+  src/assist/            Assistant: providers, tool loop, redaction, cases
+  src/networks.rs        Network identity, locations, per-network storage
+  src/adjacent.rs        Reachable subnets and the evidence for each
   src/doctor.rs          Capability probes
   src/store.rs           Snapshot persistence, pairing and diffing
   src/bin/netdiag-cli.rs Headless entry point
@@ -278,9 +388,11 @@ app/ components/ lib/    Next.js static export (no server, no API routes)
 ```
 
 The engine is a **standalone crate with no Tauri dependency**, so it builds and
-its 92 tests run on a machine with no desktop toolchain. That is what lets CI
+its 332 tests run on a machine with no desktop toolchain. That is what lets CI
 validate the per-OS code paths on all three platforms cheaply, independently of
-whether the GUI builds.
+whether the GUI builds. The assistant reuses the crate's existing TLS stack
+rather than adding an HTTP dependency; the only platform dependency is
+`windows-sys`, for the IP Helper API.
 
 Scan phase order is load-bearing: `announce` precedes `sweep` so off-subnet
 ranges are known before targets are fixed, and `connectivity` follows `sweep` so
@@ -330,9 +442,11 @@ when it ages.
 
 ## Releasing
 
-CI (`.github/workflows/ci.yml`) runs on every push: engine tests, clippy and the
-capability doctor on **Linux, macOS and Windows**, plus frontend typecheck/lint
-and a desktop build on all three.
+CI (`.github/workflows/ci.yml`) runs on every push: `cargo fmt --check`, clippy
+with warnings denied, engine tests and the capability doctor on **Linux, macOS
+and Windows**, plus frontend typecheck/lint/build and a desktop build on all
+three. Run `cargo fmt --all` before pushing — the formatting gate is the one
+that most often fails a branch that is otherwise green.
 
 To publish, push a tag:
 
@@ -369,6 +483,13 @@ secrets — the workflow already references them and skips signing when unset:
   in Rust.
 - Missing tools never fail a scan: the probe is marked unavailable, a warning is
   recorded, and everything else still runs.
+- Nothing leaves the machine unless you connect one: the controller integration
+  reads a private address with a credential you supply, and the assistant is off
+  until a model is configured. Both are read-only, and the assistant redacts
+  identifiers before sending by default.
+- Secrets — the controller password and the model API key — live in the
+  operating system's keychain, never in a settings file and never in scan
+  snapshots, which are exportable.
 
 This tool scans your own network. Do not point it at networks you are not
 responsible for.
