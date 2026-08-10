@@ -124,7 +124,7 @@ outside a device:
 | | The scan knows | The controller knows |
 | --- | --- | --- |
 | Identity | vendor from MAC, open ports, mDNS/SSDP | operator-assigned alias, DHCP fingerprint |
-| Location | nothing | **which switch port or access point** |
+| Where it is plugged in | nothing | **which switch port or access point** |
 | History | point samples | continuous association |
 | Intent | nothing | configured VLANs and networks |
 
