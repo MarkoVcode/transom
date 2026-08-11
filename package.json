@@ -1,6 +1,6 @@
 {
   "name": "transom",
-  "version": "1.9.0",
+  "version": "1.10.0",
   "description": "Transom — sees what arrived on your local network, identifies it, and explains what is wrong",
   "private": true,
   "license": "MIT",
