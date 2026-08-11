@@ -39,6 +39,22 @@ Releases are **not code-signed**, so on first launch:
 - **Windows** — SmartScreen shows "Windows protected your PC". Click
   *More info* → *Run anyway*.
 
+### Verifying a download
+
+Optional, and nothing forces it — Linux has no equivalent of Gatekeeper or
+SmartScreen, so an unsigned binary simply runs. If you would rather check:
+
+```bash
+# Checksums — SHA256SUMS is published with every release
+sha256sum -c SHA256SUMS --ignore-missing
+
+# Or confirm the file came from this repository's CI, unmodified
+gh attestation verify Transom_1.10.0_amd64.AppImage --repo MarkoVcode/transom
+```
+
+Updates are verified automatically and always, against a key built into the app;
+the above is for the copy you download by hand.
+
 ### Updates
 
 Transom updates itself. When a newer release exists it offers it once, and

@@ -129,6 +129,30 @@ done
 A mismatch means CI signed with a different key from the one compiled into the
 app, and no install will accept the release.
 
+### What a user can check
+
+The minisign key above protects *updates*. The first download is covered
+separately, by two things published with every release.
+
+**Checksums.** `SHA256SUMS` lists every other asset:
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+**Provenance.** Each binary is attested through Sigstore against this
+repository's CI identity, which ties the file to the commit and workflow that
+built it:
+
+```bash
+gh attestation verify Transom_<x.y.z>_amd64.AppImage --repo MarkoVcode/transom
+```
+
+Attestation uses a short-lived OIDC identity rather than a stored key, so unlike
+the updater key there is nothing here to back up, rotate, or lose. The `.sig`
+files and `latest.json` are not attested — they are signatures and metadata
+*about* the binaries, and `SHA256SUMS` covers them.
+
 ## Re-running a release for an existing tag
 
 Don't, unless the release is still a draft. The workflow creates a release

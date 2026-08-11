@@ -208,7 +208,37 @@ jobs:
     needs: [create-release, build]
     runs-on: ubuntu-latest
 
+    # Beyond `contents`, attestation needs an OIDC token to prove to Sigstore
+    # which workflow is asking, and permission to record the result. Declaring
+    # them per-job rather than workflow-wide keeps the build jobs — which run
+    # third-party actions over the signing key — unable to mint either.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
     steps:
+      # Fetched once, then reused by every step below: the manifest check, the
+      # checksums and the attestation all need the same bytes, and downloading
+      # them three times invites the three to disagree.
+      - name: Download the release artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        run: |
+          mkdir -p dist
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --paginate \
+            --jq '.[] | "\(.id)\t\(.name)"' > assets.tsv
+
+          while IFS=$'\t' read -r id name; do
+            # A re-run would otherwise checksum a previous run's checksum file.
+            [ "$name" = "SHA256SUMS" ] && continue
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$id" \
+              -H "Accept: application/octet-stream" > "dist/$name"
+          done < assets.tsv
+
+          ls -l dist
+
       # Every build job rewrites latest.json by reading the release's current
       # copy, merging its own platforms in and re-uploading. Two jobs finishing
       # at the same instant can therefore drop one platform's entry. Shipping
@@ -216,20 +246,12 @@ jobs:
       # find out why — so the release stays a draft until the manifest is whole.
       # Re-running the workflow regenerates it.
       - name: Verify the updater manifest covers every platform
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
         run: |
-          asset_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --paginate \
-            --jq '.[] | select(.name == "latest.json") | .id')
-
-          if [ -z "$asset_id" ]; then
+          if [ ! -s dist/latest.json ]; then
             echo "::error::No latest.json was uploaded; installed apps would find no update."
             exit 1
           fi
-
-          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
-            -H "Accept: application/octet-stream" > latest.json
+          cp dist/latest.json latest.json
 
           echo "Platforms present:"
           jq -r '.platforms | keys[]' latest.json
@@ -244,6 +266,52 @@ jobs:
           done
 
           exit $missing
+
+      # The updater's minisign signatures only protect *updates*. Nothing
+      # covered the first download, which is the copy a new user runs before any
+      # update logic exists to protect them. Checksums close the cheap half of
+      # that: `sha256sum -c SHA256SUMS` after downloading.
+      - name: Publish SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        run: |
+          (cd dist && sha256sum -- *) > SHA256SUMS
+          cat SHA256SUMS
+
+          # A re-run must replace the old file rather than collide with it.
+          old=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --paginate \
+            --jq '.[] | select(.name == "SHA256SUMS") | .id')
+          if [ -n "$old" ]; then
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$old"
+          fi
+
+          gh api --method POST \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=SHA256SUMS" \
+            -H "Content-Type: text/plain" \
+            --input SHA256SUMS > /dev/null
+
+      # Signed by Sigstore against this workflow's OIDC identity, so there is no
+      # long-lived key to store, rotate or lose — unlike the updater key, whose
+      # loss would strand every install. Binds each artifact's digest to the
+      # commit and workflow that produced it:
+      #
+      #     gh attestation verify <file> --repo MarkoVcode/transom
+      #
+      # The .sig files and latest.json are deliberately absent: they are
+      # signatures and metadata *about* these artifacts, and are covered by
+      # SHA256SUMS.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
+            dist/*.msi
+            dist/*.exe
+            dist/*.dmg
+            dist/*.app.tar.gz
 
       - name: Undraft release
         uses: actions/github-script@v7
