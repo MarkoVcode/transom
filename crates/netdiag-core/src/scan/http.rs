@@ -116,56 +116,11 @@ pub(crate) fn parse_response(raw: &str) -> Option<HttpResponse> {
         status,
         headers,
         body: if chunked {
-            decode_chunked(body)
+            crate::chunked::decode(body)
         } else {
             body.to_string()
         },
     })
-}
-
-/// Reassembles a `Transfer-Encoding: chunked` body.
-///
-/// Returns whatever it could decode rather than failing. Every caller here reads
-/// a bounded prefix of the response, so a final chunk cut short by that limit is
-/// the expected case, not a malformed server.
-///
-/// Indexing is done on bytes because chunk lengths count bytes: a chunk boundary
-/// can fall inside a multi-byte character, and slicing the `&str` there would
-/// panic.
-fn decode_chunked(body: &str) -> String {
-    let bytes = body.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut pos = 0usize;
-
-    while pos < bytes.len() {
-        let Some(offset) = bytes[pos..].windows(2).position(|w| w == b"\r\n") else {
-            break;
-        };
-        let line = &bytes[pos..pos + offset];
-
-        // A chunk length may carry extensions: "1a;name=value".
-        let token = line.split(|b| *b == b';').next().unwrap_or_default();
-        let Ok(token) = std::str::from_utf8(token) else {
-            break;
-        };
-        let Ok(size) = usize::from_str_radix(token.trim(), 16) else {
-            break;
-        };
-        if size == 0 {
-            break; // terminating chunk
-        }
-
-        let start = pos + offset + 2;
-        let end = start.saturating_add(size).min(bytes.len());
-        out.extend_from_slice(&bytes[start..end]);
-
-        if end == bytes.len() {
-            break; // truncated by the read limit
-        }
-        pos = end + 2; // step over the chunk's trailing CRLF
-    }
-
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 async fn read_bounded<S>(stream: &mut S, limit: usize) -> String

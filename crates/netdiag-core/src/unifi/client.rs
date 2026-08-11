@@ -590,38 +590,12 @@ pub(crate) fn parse_response(raw: &str) -> Option<(u16, BTreeMap<String, String>
         .map(|v| v.contains("chunked"))
         .unwrap_or(false)
     {
-        decode_chunked(body)
+        crate::chunked::decode(body)
     } else {
         body.to_string()
     };
 
     Some((status, headers, body))
-}
-
-pub(crate) fn decode_chunked(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
-    let mut rest = body;
-
-    while let Some((size_line, remainder)) = rest.split_once("\r\n") {
-        // A chunk header may carry extensions after a semicolon.
-        let size_token = size_line.split(';').next().unwrap_or("").trim();
-        let Ok(size) = usize::from_str_radix(size_token, 16) else {
-            break;
-        };
-        if size == 0 || remainder.len() < size {
-            if size == 0 {
-                break;
-            }
-            out.push_str(remainder);
-            break;
-        }
-        out.push_str(&remainder[..size]);
-        rest = remainder[size..]
-            .strip_prefix("\r\n")
-            .unwrap_or(&remainder[size..]);
-    }
-
-    out
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -741,7 +715,7 @@ mod tests {
     fn decodes_chunked_bodies() {
         let payload = r#"{"meta":{"rc":"ok"},"data":[1,2]}"#;
         let body = chunked(&[&payload[..19], &payload[19..]]);
-        assert_eq!(decode_chunked(&body), payload);
+        assert_eq!(crate::chunked::decode(&body), payload);
     }
 
     #[test]

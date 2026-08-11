@@ -20,6 +20,7 @@
 
 pub mod adjacent;
 pub mod assist;
+pub(crate) mod chunked;
 pub mod doctor;
 pub mod exec;
 pub mod netutil;

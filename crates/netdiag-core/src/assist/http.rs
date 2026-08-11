@@ -168,44 +168,11 @@ fn parse(raw: &str) -> Option<JsonResponse> {
     Some(JsonResponse {
         status,
         body: if chunked {
-            dechunk(body)
+            crate::chunked::decode(body)
         } else {
             body.to_string()
         },
     })
-}
-
-/// Reassembles a `Transfer-Encoding: chunked` body.
-///
-/// The scanner's parser never needed this: it reads banners and small pages
-/// where the body is whatever arrived. A JSON API answer must be exact, and a
-/// chunked body left raw is a parse error with hex length markers embedded in
-/// it — which reads as "the model returned nonsense" rather than "we did not
-/// decode the transport".
-fn dechunk(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
-    let mut rest = body;
-
-    while let Some((header, tail)) = rest.split_once("\r\n") {
-        // A chunk header may carry extensions after a semicolon.
-        let size_text = header.split(';').next().unwrap_or("").trim();
-        let Ok(size) = usize::from_str_radix(size_text, 16) else {
-            break;
-        };
-        if size == 0 {
-            break;
-        }
-        if tail.len() < size {
-            // Truncated — return what is decodable rather than nothing, so a
-            // size-limited read still surfaces a useful error to the caller.
-            out.push_str(tail);
-            break;
-        }
-        out.push_str(&tail[..size]);
-        rest = tail[size..].strip_prefix("\r\n").unwrap_or(&tail[size..]);
-    }
-
-    out
 }
 
 #[cfg(test)]
