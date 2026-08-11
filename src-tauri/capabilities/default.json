@@ -15,6 +15,12 @@
       "allow": [
         {
           "url": "https://github.com/MarkoVcode/*"
+        },
+        {
+          "url": "https://gettransom.vercel.app"
+        },
+        {
+          "url": "https://gettransom.vercel.app/*"
         }
       ]
     }

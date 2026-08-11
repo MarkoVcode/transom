@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { AssistantSettings } from "./AssistantSettings";
 import { UpdateDialog } from "./UpdateDialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Button, Card, Icon, StatusBadge, StatusMark, type StatusTone } from "./ui";
 import * as api from "@/lib/api";
 import type {
@@ -20,6 +21,9 @@ import type {
  * PATH" check — so the report reflects what the app can actually do on this
  * machine rather than what is merely installed.
  */
+
+/** Must stay inside the opener allowlist in `capabilities/default.json`. */
+const WEBSITE_URL = "https://gettransom.vercel.app";
 
 const STATUS_TONE: Record<CapabilityStatus, StatusTone> = {
   ok: "good",
@@ -184,6 +188,29 @@ export function SetupPanel({
             <dd className="flex flex-wrap items-center gap-3 tabular">
               {appVersion ?? "—"}
               <UpdateCheckButton />
+            </dd>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <dt className="w-40 shrink-0 text-xs" style={{ color: "var(--text-secondary)" }}>
+              Website
+            </dt>
+            <dd>
+              {/* Opened through the opener plugin rather than an anchor: the
+                  webview's CSP does not follow a plain link, so an <a> here
+                  would look right and do nothing. */}
+              <button
+                type="button"
+                onClick={() => {
+                  void openUrl(WEBSITE_URL).catch(() => {
+                    // Only reachable if the URL falls outside the capability
+                    // allowlist, which would be a build-time mistake.
+                  });
+                }}
+                className="underline"
+                style={{ color: "var(--series-1)" }}
+              >
+                {WEBSITE_URL.replace("https://", "")}
+              </button>
             </dd>
           </div>
           <div className="flex flex-wrap gap-2">
