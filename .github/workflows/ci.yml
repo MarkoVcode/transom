@@ -15,6 +15,34 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # The version lives in three files, and self-updating makes a mismatch a real
+  # bug rather than an untidiness: the dialog compares the release tag against
+  # the *Cargo* version, while the updater compares the manifest against the
+  # *tauri.conf.json* version. Drift makes the app offer an update it then
+  # refuses to install, with no way for the user to tell why.
+  versions:
+    name: Versions agree
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare
+        run: |
+          cargo="$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version = "\(.*\)"/\1/p')"
+          tauri="$(jq -r .version src-tauri/tauri.conf.json)"
+          npm="$(jq -r .version package.json)"
+
+          echo "Cargo.toml           $cargo"
+          echo "tauri.conf.json      $tauri"
+          echo "package.json         $npm"
+
+          if [ "$cargo" != "$tauri" ] || [ "$cargo" != "$npm" ]; then
+            echo "::error::Versions disagree; the updater and the update dialog would too."
+            exit 1
+          fi
+
   # The engine is a standalone crate with no GUI dependency, so it can be tested
   # on all three platforms without installing any desktop toolchain. This is the
   # job that actually validates the per-OS code paths (ARP parsing, ping flags,

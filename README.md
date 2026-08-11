@@ -39,6 +39,25 @@ Releases are **not code-signed**, so on first launch:
 - **Windows** — SmartScreen shows "Windows protected your PC". Click
   *More info* → *Run anyway*.
 
+### Updates
+
+Transom updates itself. When a newer release exists it offers it once, and
+*Update now* downloads and applies it in place and restarts — no reinstall, and
+no visit to this page. Every update is verified against a signing key built into
+the app before it is applied, so a tampered or substituted download is refused
+even though the releases themselves are not code-signed.
+
+Two exceptions, where the app opens the release page instead:
+
+- **`.deb` and `.rpm`** — the package manager owns those files, and updating
+  them needs root. Use `apt`/`dnf`, or the `.AppImage` if you want self-updating.
+- **Windows** — the installer is per-machine, so applying an update raises the
+  usual administrator prompt.
+
+The check is a single request to the GitHub releases API, cached for six hours,
+and silent when it fails — this app is often launched precisely because the
+internet is broken. It can be turned off entirely in **Setup & Status**.
+
 ---
 
 ## What it extracts

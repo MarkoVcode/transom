@@ -1870,6 +1870,83 @@ async fn delete_case(state: State<'_, Arc<AppState>>, id: String) -> Result<bool
 
 /* ----------------------------------------------------------- update checking */
 
+/// Channel the frontend listens on for update download progress.
+const UPDATE_EVENT: &str = "update://progress";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateProgress {
+    downloaded: u64,
+    /// Absent when the server sends no `Content-Length`, in which case the UI
+    /// shows an indeterminate bar rather than inventing a percentage.
+    total: Option<u64>,
+    done: bool,
+}
+
+#[tauri::command]
+fn update_install_supported() -> bool {
+    update::supports_in_app_install()
+}
+
+/// Downloads and installs the pending update, then restarts.
+///
+/// The version to install is resolved by the updater plugin against the signed
+/// manifest, not by the caller: the frontend must never be able to point this at
+/// an arbitrary URL. A signature that does not verify against the embedded
+/// public key aborts the install, so an update cannot be substituted in transit
+/// even though the releases themselves are not code-signed.
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let update = app
+        .updater()
+        .map_err(|e| e.to_string())?
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No update is available to install.".to_string())?;
+
+    let progress = std::sync::Mutex::new(0u64);
+    let emitter = &app;
+
+    update
+        .download_and_install(
+            |chunk, total| {
+                let downloaded = {
+                    let mut acc = progress.lock().unwrap_or_else(|e| e.into_inner());
+                    *acc += chunk as u64;
+                    *acc
+                };
+                let _ = emitter.emit(
+                    UPDATE_EVENT,
+                    UpdateProgress {
+                        downloaded,
+                        total,
+                        done: false,
+                    },
+                );
+            },
+            || {
+                let _ = emitter.emit(
+                    UPDATE_EVENT,
+                    UpdateProgress {
+                        downloaded: 0,
+                        total: None,
+                        done: true,
+                    },
+                );
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Only reached on macOS and Linux. On Windows the plugin hands off to the
+    // NSIS/MSI installer and exits the process from inside the call above, so
+    // this line never runs there.
+    app.restart();
+}
+
 #[tauri::command]
 async fn check_for_update(
     state: State<'_, Arc<AppState>>,
@@ -2258,6 +2335,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            // Registered here rather than as a `.plugin()` on the builder so the
+            // desktop gate matches the dependency gate in Cargo.toml.
+            #[cfg(desktop)]
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
+
             // Snapshots live in the OS-appropriate app data directory rather than
             // next to the binary, which would be read-only once installed.
             let root = app
@@ -2294,6 +2377,8 @@ pub fn run() {
             get_app_version,
             is_running_elevated,
             check_for_update,
+            update_install_supported,
+            install_update,
             get_update_preferences,
             skip_update_version,
             set_update_checks_enabled,

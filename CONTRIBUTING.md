@@ -21,6 +21,24 @@ npm install
 npm run dev
 ```
 
+### Building bundles locally
+
+`npm run dev` and `npx tauri build --no-bundle` need nothing extra. A full
+`npm run build` does: the app ships a self-updater, so the bundler signs its
+updater artifacts and fails without a key.
+
+Either skip bundling, or generate a throwaway key — it only has to match itself,
+and is unrelated to the release key:
+
+```bash
+npx tauri signer generate -w ~/.tauri/transom-dev.key
+export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/transom-dev.key)"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
+```
+
+A build signed with a throwaway key cannot install real updates, which is the
+intended behaviour: only releases signed with the project key are accepted.
+
 ## Working on the engine without a GUI
 
 `crates/netdiag-core` has **no Tauri dependency**, so you can build and test the

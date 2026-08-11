@@ -35,6 +35,15 @@ chrono.workspace = true
 # and tests with no system dependencies at all.
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 
+# Self-update. Desktop-gated because the plugin does not build for mobile, and
+# `crate-type` above keeps those targets linkable.
+#
+# Driven from Rust rather than the webview for the same reason as the update
+# check itself: the frontend has no network permissions, and the JS updater API
+# would need `updater:default` in the capability file to download over HTTP.
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-updater = "2"
+
 # Only for geteuid(), to tell the user that running elevated is unnecessary.
 # Already in the tree transitively via tokio; this just makes it callable.
 [target.'cfg(unix)'.dependencies]

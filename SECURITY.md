@@ -24,6 +24,7 @@ hold are:
 | **Credentials never leave the keychain** | UniFi controller passwords are stored in the OS keychain, never in snapshots (which are exportable) or logs. The client's `Debug` impl is written by hand so a session cookie cannot be printed. |
 | **Credentials only over a pinned connection** | The controller's TLS certificate is pinned on first use and verified **before** the login request is written. A changed fingerprint aborts without transmitting anything. The permissive verifier used for LAN banner-grabbing is deliberately *not* reused here. |
 | **Public HTTPS is fully verified** | The update check validates certificates against real CA roots — the opposite of the LAN inspection path, and a distinction worth preserving. |
+| **Updates are signature-verified** | A self-update is applied only if it verifies against the minisign public key compiled into the app. The private key exists solely as a CI secret. The frontend cannot choose what gets installed: it triggers the update, and the version and URL are resolved in Rust from the signed manifest. A substituted or modified download is refused even though the binaries are not code-signed. |
 
 Findings that would break any of the above are in scope, as are memory-safety
 issues and anything that causes the app to send data off the local network
@@ -34,6 +35,9 @@ unexpectedly.
 - The fact that the app performs unauthenticated network scanning. That is its
   purpose; it is intended for networks you are responsible for.
 - Unsigned release binaries. This is a known, documented state — see the README.
+  Note this means *code* signing (Authenticode/Apple notarisation); updates are
+  separately signed and verified, and a report that they are not is not a
+  finding.
 - Findings that require an attacker to already have code execution on the
   machine running the app.
 - The update check contacting `api.github.com` on launch. It is documented, can

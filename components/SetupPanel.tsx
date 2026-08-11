@@ -291,6 +291,26 @@ function DangerZone() {
 function UpdateCheckButton() {
   const [checking, setChecking] = useState(false);
   const [result, setResult] = useState<string | React.ReactNode | null>(null);
+  // Null until loaded, so the box does not flip from unchecked to checked.
+  const [autoCheck, setAutoCheck] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    api
+      .getUpdatePreferences()
+      .then((prefs) => setAutoCheck(prefs.checkEnabled))
+      // Leave the control hidden rather than showing a state that may be wrong.
+      .catch(() => setAutoCheck(null));
+  }, []);
+
+  const toggleAutoCheck = async (enabled: boolean) => {
+    setAutoCheck(enabled);
+    try {
+      await api.setUpdateChecksEnabled(enabled);
+    } catch {
+      // Revert rather than leave the UI claiming a preference that is not saved.
+      setAutoCheck(!enabled);
+    }
+  };
 
   const check = async () => {
     setChecking(true);
@@ -327,6 +347,20 @@ function UpdateCheckButton() {
         {checking ? "Checking…" : "Check for updates"}
       </Button>
       {result && <span style={{ color: "var(--text-secondary)" }}>{result}</span>}
+      {autoCheck !== null && (
+        <label
+          className="flex items-center gap-1.5 text-[11px]"
+          style={{ color: "var(--text-secondary)" }}
+          title="Turns off the check that runs when the app starts. This button still works."
+        >
+          <input
+            type="checkbox"
+            checked={autoCheck}
+            onChange={(event) => toggleAutoCheck(event.target.checked)}
+          />
+          Check automatically on launch
+        </label>
+      )}
     </span>
   );
 }

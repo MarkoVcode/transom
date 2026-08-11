@@ -60,6 +60,10 @@ jobs:
                 '| macOS (Intel) | `_x64.dmg` |',
                 '| Linux | `.AppImage` (portable) or `.deb` |',
                 '',
+                '### Updating',
+                '',
+                'Existing installations offer this release on launch and apply it in place — no reinstall needed. `.deb`/`.rpm` installs are the exception: those are owned by the package manager and open this page instead.',
+                '',
                 '### Note on unsigned builds',
                 '',
                 'These binaries are **not code-signed**. On first launch:',
@@ -158,14 +162,23 @@ jobs:
             echo "macos=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # TAURI_SIGNING_* is the updater's minisign key, and is unrelated to code
+      # signing: it is what the installed app checks before applying an update.
+      # It is required on every platform — without it the bundler cannot produce
+      # the updater artifacts that `createUpdaterArtifacts` asks for.
       - name: Build and upload (unsigned)
         if: steps.signing.outputs.macos == 'false'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           args: ${{ matrix.args }}
+          # Each job merges its own platforms into the release's existing
+          # latest.json rather than replacing it, so the four builds accumulate.
+          uploadUpdaterJson: true
 
       # To produce signed macOS builds, add these repository secrets and this
       # step takes over automatically:
@@ -177,6 +190,8 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -186,6 +201,7 @@ jobs:
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           args: ${{ matrix.args }}
+          uploadUpdaterJson: true
 
   publish:
     name: Publish release
@@ -193,6 +209,42 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Every build job rewrites latest.json by reading the release's current
+      # copy, merging its own platforms in and re-uploading. Two jobs finishing
+      # at the same instant can therefore drop one platform's entry. Shipping
+      # that would leave those users silently unable to update — and unable to
+      # find out why — so the release stays a draft until the manifest is whole.
+      # Re-running the workflow regenerates it.
+      - name: Verify the updater manifest covers every platform
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        run: |
+          asset_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --paginate \
+            --jq '.[] | select(.name == "latest.json") | .id')
+
+          if [ -z "$asset_id" ]; then
+            echo "::error::No latest.json was uploaded; installed apps would find no update."
+            exit 1
+          fi
+
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+            -H "Accept: application/octet-stream" > latest.json
+
+          echo "Platforms present:"
+          jq -r '.platforms | keys[]' latest.json
+
+          missing=0
+          for key in darwin-aarch64 darwin-x86_64 linux-x86_64 windows-x86_64; do
+            if ! jq -e --arg k "$key" \
+              '.platforms[$k].url and .platforms[$k].signature' latest.json > /dev/null; then
+              echo "::error::latest.json has no usable entry for $key"
+              missing=1
+            fi
+          done
+
+          exit $missing
+
       - name: Undraft release
         uses: actions/github-script@v7
         with:

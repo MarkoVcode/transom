@@ -128,6 +128,28 @@ impl UpdatePreferences {
     }
 }
 
+/// Whether this installation can replace itself in place.
+///
+/// Windows and macOS bundles always can. On Linux only an AppImage can: a `.deb`
+/// or `.rpm` is owned by the package manager, and the updater would shell out to
+/// `dpkg -i` / `rpm -U`, which needs root — something this app promises never to
+/// require. Those installs keep the old behaviour of opening the release page.
+///
+/// `APPIMAGE` is set by the AppImage runtime in every process it launches, and
+/// is the same variable the updater itself uses to locate the running image.
+pub fn supports_in_app_install() -> bool {
+    in_app_install_supported(
+        cfg!(target_os = "linux"),
+        std::env::var_os("APPIMAGE").is_some(),
+    )
+}
+
+/// Split out from [`supports_in_app_install`] so the rule is testable without
+/// mutating process-wide environment state from a parallel test run.
+fn in_app_install_supported(is_linux: bool, running_as_appimage: bool) -> bool {
+    !is_linux || running_as_appimage
+}
+
 /// A semantic version, compared numerically.
 ///
 /// String comparison is wrong in a way that only shows up later: `"1.10.0"`
@@ -374,6 +396,20 @@ mod tests {
         let long = truncate_notes(&"x".repeat(5000));
         assert!(long.chars().count() < 1300);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn only_an_appimage_can_replace_itself_on_linux() {
+        // Windows and macOS: the bundle is replaceable however it was installed.
+        assert!(in_app_install_supported(false, false));
+        assert!(in_app_install_supported(false, true));
+
+        // Linux: an AppImage is a single file this process owns and can rewrite.
+        assert!(in_app_install_supported(true, true));
+
+        // The failure this guards: offering an in-app update to a .deb/.rpm
+        // install, where the updater shells out to dpkg/rpm and needs root.
+        assert!(!in_app_install_supported(true, false));
     }
 
     #[test]

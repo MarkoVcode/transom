@@ -24,6 +24,7 @@ import type {
   UnifiConfig,
   UpdateInfo,
   UpdatePreferences,
+  UpdateProgress,
   PortInfo,
   PortProfile,
   ScanDiff,
@@ -131,6 +132,31 @@ export async function skipUpdateVersion(version: string): Promise<void> {
 
 export async function setUpdateChecksEnabled(enabled: boolean): Promise<void> {
   return invoke("set_update_checks_enabled", { enabled });
+}
+
+/**
+ * Whether this installation can replace itself in place. False for `.deb` and
+ * `.rpm`, which the package manager owns — those fall back to the release page.
+ */
+export async function updateInstallSupported(): Promise<boolean> {
+  return invoke<boolean>("update_install_supported");
+}
+
+/**
+ * Downloads, verifies and installs the pending update, then restarts the app.
+ *
+ * Resolves only on failure: a successful install never returns, because the
+ * process is replaced or exits into the platform installer.
+ */
+export async function installUpdate(): Promise<void> {
+  return invoke("install_update");
+}
+
+/** Subscribes to update download progress. Returns an unsubscribe function. */
+export async function onUpdateProgress(
+  handler: (progress: UpdateProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<UpdateProgress>("update://progress", (message) => handler(message.payload));
 }
 
 /* --------------------------------------------------------------------- UniFi */

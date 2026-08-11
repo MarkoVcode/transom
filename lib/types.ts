@@ -668,6 +668,13 @@ export interface UpdateInfo {
   publishedAt?: string;
 }
 
+export interface UpdateProgress {
+  downloaded: number;
+  /** Absent when the server sends no Content-Length. */
+  total?: number;
+  done: boolean;
+}
+
 export interface UpdatePreferences {
   checkEnabled: boolean;
   skippedVersion?: string;
