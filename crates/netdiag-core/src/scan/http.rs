@@ -103,11 +103,69 @@ pub(crate) fn parse_response(raw: &str) -> Option<HttpResponse> {
         }
     }
 
+    // A chunked body is not the body: it is the body wrapped in framing. Left
+    // undecoded, the first thing any parser sees is a hex chunk length, which is
+    // why this surfaced as "could not reach GitHub" rather than as a parse error
+    // — the API switches to chunked once a response grows past a few tens of KB,
+    // so it stayed invisible while the release payload was small.
+    let chunked = headers
+        .get("transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
+
     Some(HttpResponse {
         status,
         headers,
-        body: body.to_string(),
+        body: if chunked {
+            decode_chunked(body)
+        } else {
+            body.to_string()
+        },
     })
+}
+
+/// Reassembles a `Transfer-Encoding: chunked` body.
+///
+/// Returns whatever it could decode rather than failing. Every caller here reads
+/// a bounded prefix of the response, so a final chunk cut short by that limit is
+/// the expected case, not a malformed server.
+///
+/// Indexing is done on bytes because chunk lengths count bytes: a chunk boundary
+/// can fall inside a multi-byte character, and slicing the `&str` there would
+/// panic.
+fn decode_chunked(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut pos = 0usize;
+
+    while pos < bytes.len() {
+        let Some(offset) = bytes[pos..].windows(2).position(|w| w == b"\r\n") else {
+            break;
+        };
+        let line = &bytes[pos..pos + offset];
+
+        // A chunk length may carry extensions: "1a;name=value".
+        let token = line.split(|b| *b == b';').next().unwrap_or_default();
+        let Ok(token) = std::str::from_utf8(token) else {
+            break;
+        };
+        let Ok(size) = usize::from_str_radix(token.trim(), 16) else {
+            break;
+        };
+        if size == 0 {
+            break; // terminating chunk
+        }
+
+        let start = pos + offset + 2;
+        let end = start.saturating_add(size).min(bytes.len());
+        out.extend_from_slice(&bytes[start..end]);
+
+        if end == bytes.len() {
+            break; // truncated by the read limit
+        }
+        pos = end + 2; // step over the chunk's trailing CRLF
+    }
+
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 async fn read_bounded<S>(stream: &mut S, limit: usize) -> String
@@ -407,6 +465,58 @@ mod tests {
         assert!(parse_response("").is_none());
         assert!(parse_response("garbage").is_none());
         assert!(parse_response("HTTP/1.1\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn a_chunked_body_is_reassembled() {
+        // The shape GitHub's API returns over HTTP/1.1 once a response grows
+        // past a few tens of KB. Undecoded, the body starts with "1a" and no
+        // JSON parser gets past the first two bytes — which is how a working
+        // request came to be reported as "could not reach GitHub".
+        let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                   15\r\n{\"tag_name\":\"v1.8.0\",\r\n\
+                   e\r\n\"draft\":false}\r\n\
+                   0\r\n\r\n";
+
+        let response = parse_response(raw).unwrap();
+        assert_eq!(response.body, "{\"tag_name\":\"v1.8.0\",\"draft\":false}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&response.body).is_ok(),
+            "the decoded body must be parseable JSON"
+        );
+    }
+
+    #[test]
+    fn chunk_extensions_and_uppercase_hex_are_understood() {
+        let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                   A;name=value\r\n0123456789\r\n\
+                   0\r\n\r\n";
+        assert_eq!(parse_response(raw).unwrap().body, "0123456789");
+    }
+
+    #[test]
+    fn a_body_cut_short_by_the_read_limit_keeps_what_arrived() {
+        // read_bounded stops at its limit, so the last chunk is routinely
+        // truncated. That must yield a short body, not an empty one.
+        let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                   ff\r\ntruncated here";
+        assert_eq!(parse_response(raw).unwrap().body, "truncated here");
+    }
+
+    #[test]
+    fn a_chunk_boundary_inside_a_multibyte_character_does_not_panic() {
+        // The em dash is three bytes; splitting it across chunks is legal and
+        // must not panic the way slicing a &str on that index would.
+        let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                   2\r\n\u{2014}\r\n\
+                   0\r\n\r\n";
+        let _ = parse_response(raw).unwrap().body;
+    }
+
+    #[test]
+    fn an_unchunked_body_is_left_alone() {
+        let raw = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody";
+        assert_eq!(parse_response(raw).unwrap().body, "body");
     }
 
     #[tokio::test]

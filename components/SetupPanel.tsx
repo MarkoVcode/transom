@@ -2,9 +2,16 @@
 
 import { useEffect, useState } from "react";
 import { AssistantSettings } from "./AssistantSettings";
+import { UpdateDialog } from "./UpdateDialog";
 import { Button, Card, Icon, StatusBadge, StatusMark, type StatusTone } from "./ui";
 import * as api from "@/lib/api";
-import type { CapabilityReport, CapabilityStatus, DoctorReport, Tier } from "@/lib/types";
+import type {
+  CapabilityReport,
+  CapabilityStatus,
+  DoctorReport,
+  Tier,
+  UpdateInfo,
+} from "@/lib/types";
 
 /**
  * Setup & Status.
@@ -287,12 +294,17 @@ function DangerZone() {
  * The automatic startup check caches its result for several hours to protect
  * the GitHub rate limit — which means a release published within that window
  * is invisible until the cache expires. This button is the escape hatch.
+ *
+ * A found update opens the same dialog the startup check opens, so installing
+ * one does not depend on having restarted the app at the right moment.
  */
 function UpdateCheckButton() {
   const [checking, setChecking] = useState(false);
   const [result, setResult] = useState<string | React.ReactNode | null>(null);
   // Null until loaded, so the box does not flip from unchecked to checked.
   const [autoCheck, setAutoCheck] = useState<boolean | null>(null);
+  // The offer, shown in the same dialog the startup check uses.
+  const [offer, setOffer] = useState<UpdateInfo | null>(null);
 
   useEffect(() => {
     api
@@ -320,17 +332,12 @@ function UpdateCheckButton() {
       if (!info) {
         setResult("Could not reach GitHub — check again later.");
       } else if (info.updateAvailable) {
-        setResult(
-          <a
-            href={info.releaseUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="underline"
-            style={{ color: "var(--series-1)" }}
-          >
-            Version {info.latestVersion} is available →
-          </a>,
-        );
+        // Open the same dialog the startup check opens, rather than linking to
+        // the release page. A link here could only ever lead to a manual
+        // reinstall — and, being a plain `target="_blank"` anchor, the webview's
+        // CSP meant it did not even open.
+        setOffer(info);
+        setResult(null);
       } else {
         setResult(`Up to date — ${info.latestVersion} is the latest release.`);
       }
@@ -360,6 +367,17 @@ function UpdateCheckButton() {
           />
           Check automatically on launch
         </label>
+      )}
+      {offer && (
+        <UpdateDialog
+          info={offer}
+          onClose={() => {
+            setOffer(null);
+            // Say something after the dialog closes, so the button does not
+            // look as though nothing happened.
+            setResult(`Version ${offer.latestVersion} is available.`);
+          }}
+        />
       )}
     </span>
   );

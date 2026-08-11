@@ -2236,7 +2236,7 @@ dependencies = [
 
 [[package]]
 name = "netdiag-core"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "chrono",
  "futures",
@@ -4477,7 +4477,7 @@ dependencies = [
 
 [[package]]
 name = "transom"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "chrono",
  "keyring",
