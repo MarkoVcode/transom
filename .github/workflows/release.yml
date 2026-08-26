@@ -323,3 +323,22 @@ jobs:
               release_id: ${{ needs.create-release.outputs.release_id }},
               draft: false,
             });
+
+      # The website statically caches the latest-release info; this tells it to
+      # refetch now instead of waiting out its revalidation window. Runs after
+      # undrafting so the site never revalidates into a still-draft (invisible)
+      # release. The release itself is already out by this point, so a failure
+      # here only means the site shows the previous version until its cache
+      # expires — worth a red run to notice, not worth blocking anything.
+      - name: Revalidate website release cache
+        env:
+          RELEASE_REVALIDATE_TOKEN: ${{ secrets.RELEASE_REVALIDATE_TOKEN_WEBSITE }}
+        run: |
+          if [ -z "$RELEASE_REVALIDATE_TOKEN" ]; then
+            echo "::error::RELEASE_REVALIDATE_TOKEN_WEBSITE secret is not set; website was not revalidated."
+            exit 1
+          fi
+          curl -fsS --retry 3 --retry-all-errors --max-time 30 \
+            -X POST \
+            -H "Authorization: Bearer $RELEASE_REVALIDATE_TOKEN" \
+            https://gettransom.com/api/release/revalidate
