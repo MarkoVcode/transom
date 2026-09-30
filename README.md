@@ -4,6 +4,7 @@
 [![Release](https://github.com/MarkoVcode/transom/actions/workflows/release.yml/badge.svg)](https://github.com/MarkoVcode/transom/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](https://github.com/MarkoVcode/transom/releases)
+[![Website](https://img.shields.io/badge/website-gettransom.vercel.app-informational)](https://gettransom.vercel.app)
 
 *Over the transom*: something that arrived unannounced, without introduction —
 from the small window above a door, which is what a transom is.
@@ -18,11 +19,15 @@ describe in your own words.
 Runs on **Windows, macOS and Linux**. Needs **no administrator privileges** and
 **no extra tools installed**.
 
+**Website:** [gettransom.vercel.app](https://gettransom.vercel.app) — an overview
+of what Transom does, with download links for the latest release.
+
 ---
 
 ## Install
 
 Download the installer for your platform from the
+[website](https://gettransom.vercel.app) or the
 [Releases](https://github.com/MarkoVcode/transom/releases) page:
 
 | Platform | File |
